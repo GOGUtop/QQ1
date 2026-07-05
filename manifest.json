@@ -1,0 +1,21 @@
+{
+  "display_name": "Role Memory Forge",
+  "loading_order": 310,
+  "requires": [],
+  "optional": [],
+  "dependencies": [],
+  "js": "index.js",
+  "css": "style.css",
+  "author": "OpenAI / 丁浩 custom build",
+  "version": "0.1.0",
+  "homePage": "https://github.com/your-name/SillyTavern-RoleMemoryForge",
+  "auto_update": true,
+  "minimum_client_version": "1.14.0",
+  "generate_interceptor": "RoleMemoryForge_generateInterceptor",
+  "hooks": {
+    "activate": "onActivate",
+    "enable": "onEnable",
+    "disable": "onDisable",
+    "clean": "onClean"
+  }
+}

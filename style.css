@@ -1,0 +1,116 @@
+#rmf_settings.rmf-panel {
+    border: 1px solid var(--SmartThemeBorderColor, rgba(255,255,255,.16));
+    border-radius: 14px;
+    padding: 14px;
+    margin: 12px 0;
+    background: linear-gradient(135deg, rgba(120,120,255,.08), rgba(255,255,255,.035));
+    box-shadow: 0 10px 28px rgba(0,0,0,.18);
+}
+
+.rmf-head {
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+    align-items: center;
+    margin-bottom: 10px;
+}
+
+.rmf-head strong {
+    font-size: 1.05rem;
+    letter-spacing: .2px;
+}
+
+.rmf-head small {
+    display: block;
+    opacity: .72;
+    margin-top: 2px;
+}
+
+#rmf_status {
+    max-width: 45%;
+    text-align: right;
+    opacity: .78;
+    font-size: .86rem;
+}
+
+.rmf-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+    gap: 10px;
+    margin-top: 10px;
+}
+
+.rmf-grid label {
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+    font-size: .9rem;
+    opacity: .92;
+}
+
+.rmf-grid input,
+.rmf-grid select {
+    width: 100%;
+    border-radius: 10px;
+}
+
+.rmf-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin: 12px 0;
+}
+
+.rmf-actions .danger {
+    border-color: rgba(255,80,80,.55) !important;
+}
+
+.rmf-dashboard {
+    border-radius: 12px;
+    padding: 10px;
+    background: rgba(0,0,0,.12);
+    max-height: 420px;
+    overflow: auto;
+}
+
+.rmf-statline {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px 14px;
+    margin-bottom: 8px;
+    opacity: .9;
+}
+
+.rmf-dashboard details {
+    border-top: 1px solid rgba(255,255,255,.1);
+    padding: 8px 0;
+}
+
+.rmf-dashboard summary {
+    cursor: pointer;
+    font-weight: 600;
+}
+
+.rmf-dashboard pre {
+    white-space: pre-wrap;
+    overflow: auto;
+    background: rgba(0,0,0,.16);
+    border-radius: 10px;
+    padding: 8px;
+}
+
+.rmf-error {
+    color: #ffb4b4;
+    background: rgba(255,0,0,.12);
+    border: 1px solid rgba(255,80,80,.3);
+    border-radius: 10px;
+    padding: 8px;
+    margin: 8px 0;
+}
+
+.rmf-note {
+    opacity: .68;
+    font-size: .82rem;
+    margin-top: 8px;
+    line-height: 1.45;
+}
