@@ -1,4 +1,4 @@
-// Role Memory Forge v0.4.0
+// Role Memory Forge v0.4.1
 // 这一版不再使用会直接炸掉插件的静态 import。
 // SillyTavern 内部模块路径有时会随版本变化，静态 import 一旦失败，悬浮球和入口都会消失。
 // 这里改为：先渲染 UI，再动态按需加载 ST API / WorldInfo API。
@@ -1091,12 +1091,104 @@ function buildMegaSummaryPrompt({ oldMega, summaries }) {
 
 
 function makePairKey(userIndex, aiIndex, userText, aiText) {
-    return `${userIndex}:${aiIndex}:${String(userText || '').slice(0, 60)}:${String(aiText || '').slice(0, 60)}`;
+    return `${userIndex}:${aiIndex}:${String(userText || '').slice(0, 80)}:${String(aiText || '').slice(0, 80)}`;
+}
+
+function getMessageRawContent(message) {
+    if (!message) return '';
+    let text = message.mes;
+    if ((!text || !String(text).trim()) && Array.isArray(message.swipes) && message.swipes.length) {
+        const swipeId = Number.isFinite(Number(message.swipe_id)) ? Number(message.swipe_id) : 0;
+        text = message.swipes[swipeId] || message.swipes[0] || '';
+    }
+    return String(text ?? '');
+}
+
+function getMessageText(message) {
+    return stripHtml(getMessageRawContent(message));
+}
+
+function normalizeNameForScan(name = '') {
+    return String(name || '')
+        .replace(/[\s\u200b]+/g, '')
+        .replace(/^@+/, '')
+        .trim()
+        .toLowerCase();
+}
+
+function getKnownUserNamesForScan() {
+    const ctx = context();
+    const names = new Set([
+        ctx.name1,
+        ctx.user?.name,
+        ctx.userName,
+        ctx.persona?.name,
+        ctx.persona_description?.name,
+        'user',
+        '{{user}}',
+        'you',
+        '我',
+        '你',
+        '玩家',
+        '用户',
+    ].filter(Boolean).map(normalizeNameForScan));
+    return names;
+}
+
+function getKnownAssistantNamesForScan() {
+    const ctx = context();
+    const char = ctx.characters?.[ctx.characterId];
+    const names = new Set([
+        getCharacterName(),
+        ctx.name2,
+        char?.name,
+        char?.data?.name,
+        'assistant',
+        'ai',
+    ].filter(Boolean).map(normalizeNameForScan));
+    if (Array.isArray(ctx.groups) && ctx.groupId) {
+        const group = ctx.groups.find((g) => String(g.id) === String(ctx.groupId));
+        if (Array.isArray(group?.members)) {
+            for (const member of group.members) {
+                if (typeof member === 'string') names.add(normalizeNameForScan(member));
+                if (member?.name) names.add(normalizeNameForScan(member.name));
+            }
+        }
+    }
+    return names;
+}
+
+function getMessageRole(message) {
+    if (!message) return 'empty';
+    if (message.is_system || message.system || message.extra?.type === 'system') return 'system';
+    if (isRmfUtilityMessage(message)) return 'system';
+
+    const text = getMessageText(message);
+    if (!text) return 'empty';
+
+    const roleFields = [message.role, message.sender, message.type, message.extra?.role, message.extra?.sender]
+        .filter(Boolean).map((x) => String(x).toLowerCase());
+    if (roleFields.some((x) => ['system', 'instruction'].includes(x))) return 'system';
+    if (roleFields.some((x) => ['user', 'human', 'player'].includes(x))) return 'user';
+    if (roleFields.some((x) => ['assistant', 'character', 'bot', 'ai', 'model'].includes(x))) return 'assistant';
+
+    if (message.is_user === true || message.is_user === 'true') return 'user';
+    if (message.is_user === false || message.is_user === 'false') return 'assistant';
+
+    const name = normalizeNameForScan(message.name || message.user || message.from || message.sender_name || message.extra?.name || '');
+    const userNames = getKnownUserNamesForScan();
+    const assistantNames = getKnownAssistantNamesForScan();
+    if (name && userNames.has(name)) return 'user';
+    if (name && assistantNames.has(name)) return 'assistant';
+
+    // 有些导入的 json/jsonl 没有 is_user，只保留 name。只要名字不是当前 user，就按角色/AI 处理。
+    if (name && !userNames.has(name)) return 'assistant';
+    return 'unknown';
 }
 
 function exchangeFromIndexes(chat, userIndex, aiIndex) {
-    const userText = stripHtml(chat[userIndex]?.mes);
-    const aiText = stripHtml(chat[aiIndex]?.mes);
+    const userText = getMessageText(chat[userIndex]);
+    const aiText = getMessageText(chat[aiIndex]);
     if (!userText || !aiText) return null;
     return {
         pairKey: makePairKey(userIndex, aiIndex, userText, aiText),
@@ -1109,54 +1201,115 @@ function exchangeFromIndexes(chat, userIndex, aiIndex) {
     };
 }
 
-function getAllChatExchanges() {
-    const chat = context().chat || [];
+function pushUniquePair(target, seen, exchange) {
+    if (!exchange || seen.has(exchange.pairKey)) return;
+    seen.add(exchange.pairKey);
+    target.push(exchange);
+}
+
+function buildSequentialPairs(chat, roles) {
     const pairs = [];
+    const seen = new Set();
     let waitingUserIndex = -1;
 
     for (let i = 0; i < chat.length; i++) {
-        const message = chat[i];
-        if (!message || message.is_system) continue;
-        const text = stripHtml(message.mes);
-        if (!text) continue;
-        if (message.is_user) {
+        const role = roles[i];
+        if (role === 'system' || role === 'empty') continue;
+        if (role === 'user') {
             waitingUserIndex = i;
             continue;
         }
-        if (!message.is_user && waitingUserIndex >= 0 && !isRmfUtilityMessage(message)) {
-            const exchange = exchangeFromIndexes(chat, waitingUserIndex, i);
-            if (exchange) pairs.push(exchange);
+        if ((role === 'assistant' || role === 'unknown') && waitingUserIndex >= 0) {
+            pushUniquePair(pairs, seen, exchangeFromIndexes(chat, waitingUserIndex, i));
             waitingUserIndex = -1;
-        }
-    }
-
-    // 兼容部分导入记录：如果不是严格 user/assistant 交替，退回“每条 AI 找最近 user”的方式补全。
-    if (!pairs.length) {
-        for (let aiIndex = 0; aiIndex < chat.length; aiIndex++) {
-            const ai = chat[aiIndex];
-            if (!ai || ai.is_user || ai.is_system || isRmfUtilityMessage(ai) || !stripHtml(ai.mes)) continue;
-            let userIndex = -1;
-            for (let j = aiIndex - 1; j >= 0; j--) {
-                if (chat[j]?.is_user && !chat[j]?.is_system && stripHtml(chat[j]?.mes)) {
-                    userIndex = j;
-                    break;
-                }
-            }
-            if (userIndex >= 0) {
-                const exchange = exchangeFromIndexes(chat, userIndex, aiIndex);
-                if (exchange) pairs.push(exchange);
-            }
         }
     }
     return pairs;
 }
 
+function buildNearestUserPairs(chat, roles) {
+    const pairs = [];
+    const seen = new Set();
+    for (let aiIndex = 0; aiIndex < chat.length; aiIndex++) {
+        const role = roles[aiIndex];
+        if (role !== 'assistant' && role !== 'unknown') continue;
+        if (!getMessageText(chat[aiIndex])) continue;
+        let userIndex = -1;
+        for (let j = aiIndex - 1; j >= 0; j--) {
+            if (roles[j] === 'system' || roles[j] === 'empty') continue;
+            if (roles[j] === 'user') {
+                userIndex = j;
+                break;
+            }
+            // 如果中间已经出现另一个 assistant，仍继续往前找 user，兼容多角色/旁白导入。
+        }
+        if (userIndex >= 0) pushUniquePair(pairs, seen, exchangeFromIndexes(chat, userIndex, aiIndex));
+    }
+    return pairs;
+}
+
+function buildAlternatingFallbackPairs(chat, roles) {
+    // 最后兜底：某些外部 jsonl 导入会丢失 is_user/name，只剩纯文本顺序。
+    // 这种情况下按“奇偶层”尝试成对，但只有在正常扫描很少时才会使用。
+    const candidates = [];
+    for (let i = 0; i < chat.length; i++) {
+        if (roles[i] === 'system' || roles[i] === 'empty') continue;
+        const text = getMessageText(chat[i]);
+        if (!text) continue;
+        candidates.push(i);
+    }
+    const pairs = [];
+    const seen = new Set();
+    const start = roles[candidates[0]] === 'assistant' ? 1 : 0;
+    for (let i = start; i < candidates.length - 1; i += 2) {
+        const userIndex = candidates[i];
+        const aiIndex = candidates[i + 1];
+        pushUniquePair(pairs, seen, exchangeFromIndexes(chat, userIndex, aiIndex));
+    }
+    return pairs;
+}
+
+function getAllChatExchanges() {
+    const chat = context().chat || [];
+    const roles = chat.map((message) => getMessageRole(message));
+
+    const sequential = buildSequentialPairs(chat, roles);
+    const nearest = buildNearestUserPairs(chat, roles);
+    const alternating = buildAlternatingFallbackPairs(chat, roles);
+
+    let best = sequential;
+    if (nearest.length > best.length) best = nearest;
+    // 当正常识别明显过少时，用纯顺序兜底；避免你导入 200 多层却只识别到 3 轮。
+    if (best.length < 5 && alternating.length > best.length) best = alternating;
+
+    best.sort((a, b) => a.aiIndex - b.aiIndex || a.userIndex - b.userIndex);
+    const uniq = [];
+    const seen = new Set();
+    for (const pair of best) pushUniquePair(uniq, seen, pair);
+    return uniq;
+}
+
+function getChatScanStats() {
+    const chat = context().chat || [];
+    const roles = chat.map((message) => getMessageRole(message));
+    return {
+        messages: chat.length,
+        user: roles.filter((x) => x === 'user').length,
+        assistant: roles.filter((x) => x === 'assistant').length,
+        unknown: roles.filter((x) => x === 'unknown').length,
+        system: roles.filter((x) => x === 'system').length,
+        empty: roles.filter((x) => x === 'empty').length,
+        pairs: getAllChatExchanges().length,
+    };
+}
+
 function getLatestExchange() {
     const chat = context().chat || [];
+    const roles = chat.map((message) => getMessageRole(message));
     let aiIndex = -1;
     for (let i = chat.length - 1; i >= 0; i--) {
-        const m = chat[i];
-        if (m && !m.is_user && !m.is_system && !isRmfUtilityMessage(m) && stripHtml(m.mes)) {
+        const role = roles[i];
+        if ((role === 'assistant' || role === 'unknown') && getMessageText(chat[i])) {
             aiIndex = i;
             break;
         }
@@ -1164,8 +1317,7 @@ function getLatestExchange() {
     if (aiIndex <= 0) return null;
     let userIndex = -1;
     for (let i = aiIndex - 1; i >= 0; i--) {
-        const m = chat[i];
-        if (m && m.is_user && !m.is_system && stripHtml(m.mes)) {
+        if (roles[i] === 'user' && getMessageText(chat[i])) {
             userIndex = i;
             break;
         }
@@ -1173,7 +1325,6 @@ function getLatestExchange() {
     if (userIndex < 0) return null;
     return exchangeFromIndexes(chat, userIndex, aiIndex);
 }
-
 
 let processing = false;
 let pendingProcess = false;
@@ -1368,9 +1519,14 @@ async function rescanCurrentChat({ confirmFirst = true, clearFirst = true, label
     const s = settings();
     if (!s.enabled) return toast('请先启用插件。', 'warning');
     const pairs = getAllChatExchanges();
-    if (!pairs.length) return toast('没有找到可补录的 user/AI 对话轮。', 'warning');
+    const scan = getChatScanStats();
+    if (!pairs.length) {
+        toast('没有找到可补录的 user/AI 对话轮。', 'warning');
+        updateStatus(`扫描结果：消息 ${scan.messages}，user ${scan.user}，AI ${scan.assistant}，未知 ${scan.unknown}，成对 0`);
+        return;
+    }
     if (confirmFirst) {
-        const ok = confirm(`即将从 0 层开始一键记忆 ${pairs.length} 轮${label}。\n\n这会调用总结模型逐轮补录，聊天越长耗时越久。是否开始？`);
+        const ok = confirm(`即将从 0 层开始一键记忆 ${pairs.length} 轮${label}。\n\n扫描到：总消息 ${scan.messages} 条；user ${scan.user} 条；AI ${scan.assistant} 条；未知 ${scan.unknown} 条；系统/空消息 ${scan.system + scan.empty} 条。\n\n这会调用总结模型逐轮补录，聊天越长耗时越久。是否开始？`);
         if (!ok) return;
     }
 
