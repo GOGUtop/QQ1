@@ -1,4 +1,4 @@
-// Role Memory Forge v0.3.1
+// Role Memory Forge v0.4.0
 // 这一版不再使用会直接炸掉插件的静态 import。
 // SillyTavern 内部模块路径有时会随版本变化，静态 import 一旦失败，悬浮球和入口都会消失。
 // 这里改为：先渲染 UI，再动态按需加载 ST API / WorldInfo API。
@@ -161,6 +161,9 @@ const RECORDS_ENTRY_COMMENT = `${ENTRY_MARK} 01 每层简记流水`;
 const RELATION_ENTRY_COMMENT = `${ENTRY_MARK} 02 可视化关系表`;
 const INDEX_ENTRY_COMMENT = `${ENTRY_MARK} 03 RMF_INDEX_DATABASE`;
 const WORLD_ENTRY_COMMENT = `${ENTRY_MARK} 04 状态档案设定表`;
+const WALKTHROUGH_MARK = '<!--RMF_WALKTHROUGH_START-->';
+const WALKTHROUGH_END = '<!--RMF_WALKTHROUGH_END-->';
+const WALKTHROUGH_ENTRY_COMMENT = `${ENTRY_MARK} 05 走马灯回顾`;
 
 const DEFAULT_SETTINGS = Object.freeze({
     enabled: false,
@@ -178,6 +181,9 @@ const DEFAULT_SETTINGS = Object.freeze({
     maxRecordsStored: 600,
     maxOutputTokens: 1200,
     temperature: 0.15,
+    worldSyncMode: 'character', // character | selected | custom
+    autoSyncWorldBook: true,
+    allowCreateFallbackWorldBook: false,
     worldNameTemplate: 'RMF-{{char}}-记忆世界书',
     showToast: true,
     autoProcess: true,
@@ -186,6 +192,10 @@ const DEFAULT_SETTINGS = Object.freeze({
     briefFoldTitle: '🧠 本轮记忆简记',
     showFloatingPanel: true,
     relationGraphMaxNodes: 10,
+    historyBatchSaveEvery: 5,
+    walkThroughChunkPairs: 18,
+    walkThroughMaxPairs: 160,
+    walkThroughAddToChat: true,
 });
 
 function context() {
@@ -232,7 +242,15 @@ function stripRmfFoldHtml(input = '') {
     return String(input ?? '')
         .replace(/\n*<!--RMF_BRIEF_START-->[\s\S]*?<!--RMF_BRIEF_END-->\s*/gi, '')
         .replace(/\n*<details\b[^>]*(?:rmf-brief-fold|data-rmf-brief)[\s\S]*?<\/details>\s*/gi, '')
+        .replace(/\n*<!--RMF_WALKTHROUGH_START-->[\s\S]*?<!--RMF_WALKTHROUGH_END-->\s*/gi, '')
         .trim();
+}
+
+function isRmfUtilityMessage(message) {
+    const raw = String(message?.mes || '');
+    return raw.includes('RMF_WALKTHROUGH_START')
+        || raw.includes('RMF_WALKTHROUGH_END')
+        || message?.extra?.type === 'rmf_walkthrough';
 }
 
 function stripHtml(input = '') {
@@ -280,15 +298,104 @@ function sanitizeWorldName(name) {
         .slice(0, 120);
 }
 
-function getWorldName() {
+function getCustomWorldName() {
     const s = settings();
     const charName = getCharacterName();
     const chatId = context().chatId || 'chat';
     return sanitizeWorldName(
-        s.worldNameTemplate
+        (s.worldNameTemplate || DEFAULT_SETTINGS.worldNameTemplate)
             .replaceAll('{{char}}', charName)
             .replaceAll('{{chat}}', String(chatId))
     );
+}
+
+function addWorldCandidate(list, value) {
+    if (!value) return;
+    if (Array.isArray(value)) {
+        value.forEach((item) => addWorldCandidate(list, item));
+        return;
+    }
+    if (typeof value === 'object') {
+        for (const key of ['name', 'world', 'worldName', 'world_info', 'worldInfo', 'book', 'lorebook', 'lore_book']) {
+            if (value[key]) addWorldCandidate(list, value[key]);
+        }
+        return;
+    }
+    const name = sanitizeWorldName(String(value));
+    if (name && !list.includes(name)) list.push(name);
+}
+
+function getCharacterWorldNames() {
+    const ctx = context();
+    const char = ctx.characters?.[ctx.characterId];
+    const list = [];
+    if (!char) return list;
+
+    // 不同 ST 版本 / 不同导入来源对“角色卡绑定世界书”的字段命名不完全一致，这里做宽松兼容。
+    addWorldCandidate(list, char.world);
+    addWorldCandidate(list, char.worldInfo);
+    addWorldCandidate(list, char.world_info);
+    addWorldCandidate(list, char.lorebook);
+    addWorldCandidate(list, char.lore_book);
+    addWorldCandidate(list, char.extensions?.world);
+    addWorldCandidate(list, char.extensions?.worldInfo);
+    addWorldCandidate(list, char.extensions?.world_info);
+    addWorldCandidate(list, char.data?.extensions?.world);
+    addWorldCandidate(list, char.data?.extensions?.worldInfo);
+    addWorldCandidate(list, char.data?.extensions?.world_info);
+    addWorldCandidate(list, char.data?.extensions?.world_name);
+    addWorldCandidate(list, char.data?.extensions?.book);
+    addWorldCandidate(list, char.data?.extensions?.lorebook);
+    addWorldCandidate(list, char.data?.extensions?.lore_book);
+    addWorldCandidate(list, char.data?.extensions?.sillytavern?.world);
+    addWorldCandidate(list, char.data?.extensions?.sillytavern?.worldInfo);
+    addWorldCandidate(list, char.data?.extensions?.sillytavern?.world_info);
+    addWorldCandidate(list, char.data?.character_book?.name);
+    return list;
+}
+
+function getSelectedWorldName() {
+    const selectors = ['#world_info', '#world_editor_select', '#character_world', '#rmf_world_target_select'];
+    for (const selector of selectors) {
+        const el = document.querySelector(selector);
+        if (!el) continue;
+        const option = el.selectedOptions?.[0];
+        const text = option?.textContent?.trim();
+        const value = option?.value?.trim();
+        const candidate = text && text !== 'None' && text !== '---' ? text : value;
+        if (candidate && candidate !== '0' && candidate !== '-1') return sanitizeWorldName(candidate);
+    }
+    const ctx = context();
+    addWorldCandidate.__tmp = [];
+    addWorldCandidate(addWorldCandidate.__tmp, ctx.chatMetadata?.world_info);
+    addWorldCandidate(addWorldCandidate.__tmp, ctx.worldInfo);
+    return addWorldCandidate.__tmp?.[0] || '';
+}
+
+function resolveWorldBookTarget({ allowFallback = true } = {}) {
+    const s = settings();
+    const mode = s.worldSyncMode || 'character';
+    const charWorld = getCharacterWorldNames()[0] || '';
+    const selectedWorld = getSelectedWorldName();
+
+    if (mode === 'character') {
+        if (charWorld) return { worldName: charWorld, mode, source: '角色卡自带世界书', canCreate: false };
+        if (allowFallback && s.allowCreateFallbackWorldBook) return { worldName: getCustomWorldName(), mode: 'custom', source: '自定义 RMF 世界书', canCreate: true };
+        return { worldName: '', mode, source: '未检测到角色卡自带世界书', canCreate: false };
+    }
+
+    if (mode === 'selected') {
+        if (selectedWorld) return { worldName: selectedWorld, mode, source: '当前选中的世界书', canCreate: false };
+        if (allowFallback && s.allowCreateFallbackWorldBook) return { worldName: getCustomWorldName(), mode: 'custom', source: '自定义 RMF 世界书', canCreate: true };
+        return { worldName: '', mode, source: '未检测到当前选中的世界书', canCreate: false };
+    }
+
+    return { worldName: getCustomWorldName(), mode: 'custom', source: '自定义 RMF 世界书', canCreate: true };
+}
+
+function getWorldName() {
+    const target = resolveWorldBookTarget({ allowFallback: true });
+    return target.worldName || '未检测到角色卡自带世界书';
 }
 
 function createEmptyTracker() {
@@ -322,6 +429,7 @@ function createEmptyState() {
             updatedAt: '',
         },
         tracker: createEmptyTracker(),
+        walkthrough: { content: '', totalPairs: 0, updatedAt: '' },
         processedPairs: [],
         lastError: '',
     };
@@ -334,6 +442,7 @@ function normalizeState(raw) {
     state.summaries = Array.isArray(state.summaries) ? state.summaries : [];
     state.megaSummary = { ...base.megaSummary, ...(state.megaSummary || {}) };
     state.tracker = { ...base.tracker, ...(state.tracker || {}) };
+    state.walkthrough = { ...base.walkthrough, ...(state.walkthrough || {}) };
     state.tracker.characterStates = state.tracker.characterStates || {};
     state.tracker.profiles = state.tracker.profiles || {};
     state.tracker.relationships = Array.isArray(state.tracker.relationships) ? state.tracker.relationships : [];
@@ -381,16 +490,21 @@ function findGeneratedEntries(data) {
 
 async function ensureWorldBook() {
     const state = getState();
-    const worldName = state.worldName || getWorldName();
+    const target = resolveWorldBookTarget({ allowFallback: true });
+    const worldName = target.worldName;
+    if (!worldName) {
+        throw new Error(`${target.source}。请先在角色卡里绑定世界书，或在插件里把同步目标改为“当前选中的世界书/自定义 RMF 世界书”。`);
+    }
     state.worldName = worldName;
+    state.worldSource = target.source;
     let data = await loadWorldInfo(worldName);
-    if (!data) {
+    if (!data && target.canCreate) {
         await createNewWorldInfo(worldName, { interactive: false });
         await updateWorldInfoList();
         data = await loadWorldInfo(worldName);
     }
     if (!data) {
-        throw new Error(`无法创建或读取世界书：${worldName}`);
+        throw new Error(`无法读取世界书：${worldName}。当前模式为“${target.source}”，不会自动新建世界书。`);
     }
     data.entries ||= {};
     return { worldName, data };
@@ -458,6 +572,9 @@ async function restoreStateFromWorldBookIfNeeded() {
     const empty = createEmptyState();
     ctx.chatMetadata[MEMORY_KEY] = empty;
     try {
+        const target = resolveWorldBookTarget({ allowFallback: true });
+        if (!target.worldName) throw new Error(target.source);
+        empty.worldName = target.worldName;
         const data = await loadWorldInfo(empty.worldName);
         const restored = extractJsonFromRawEntry(data);
         if (restored) {
@@ -480,6 +597,7 @@ async function writeWorldBook() {
     upsertEntry(data, RELATION_ENTRY_COMMENT, buildRelationBook(state), 30);
     upsertEntry(data, INDEX_ENTRY_COMMENT, buildIndexDatabaseBook(state), 40);
     upsertEntry(data, WORLD_ENTRY_COMMENT, buildStateTablesBook(state), 50);
+    upsertEntry(data, WALKTHROUGH_ENTRY_COMMENT, buildWalkthroughBook(state), 60);
 
     if (settings().includeRawJsonEntry) {
         upsertEntry(data, RAW_ENTRY_COMMENT, `\`\`\`json\n${JSON.stringify(state, null, 2)}\n\`\`\``, 999);
@@ -612,6 +730,18 @@ function buildStateTablesBook(state) {
     ].join('\n');
 }
 
+
+function buildWalkthroughBook(state) {
+    const last = state.walkthrough || {};
+    return [
+        '# RMF 走马灯回顾',
+        `更新时间：${last.updatedAt || '暂无'}`,
+        `覆盖轮数：${last.totalPairs || 0}`,
+        '',
+        last.content || '暂无。点击插件面板里的“走马灯回顾”后会生成完整剧情回顾。',
+    ].join('\n');
+}
+
 function objectToBulletList(obj) {
     if (!obj || typeof obj !== 'object' || !Object.keys(obj).length) return '暂无。';
     return Object.entries(obj).map(([key, value]) => `- ${key}：${Array.isArray(value) ? value.join('；') : value}`).join('\n');
@@ -700,6 +830,7 @@ function buildPlotIndexTable(state = getState()) {
         ['发展方向', state?.tracker?.development || ''],
         ['大总结覆盖到简记', state?.megaSummary?.coversRecordId || 0],
         ['世界书', state?.worldName || getWorldName()],
+        ['同步来源', state?.worldSource || resolveWorldBookTarget({ allowFallback: true }).source],
     ]);
 }
 
@@ -958,12 +1089,74 @@ function buildMegaSummaryPrompt({ oldMega, summaries }) {
     return `请把旧大总结和新的阶段总结合并成一个更稳定的大总结。\n要求：中文；保留长期有效事实、关系、世界设定、剧情主线、关键物品和承诺；删除重复；不要编造；不要过度细节化。\n\n【旧大总结】\n${oldMega || '暂无'}\n\n【新的阶段总结】\n${summaries.map((s, i) => `${i + 1}. ${s.content}`).join('\n')}\n\n只输出 JSON：{"megaSummary":"合并后的大总结"}`;
 }
 
+
+function makePairKey(userIndex, aiIndex, userText, aiText) {
+    return `${userIndex}:${aiIndex}:${String(userText || '').slice(0, 60)}:${String(aiText || '').slice(0, 60)}`;
+}
+
+function exchangeFromIndexes(chat, userIndex, aiIndex) {
+    const userText = stripHtml(chat[userIndex]?.mes);
+    const aiText = stripHtml(chat[aiIndex]?.mes);
+    if (!userText || !aiText) return null;
+    return {
+        pairKey: makePairKey(userIndex, aiIndex, userText, aiText),
+        userIndex,
+        aiIndex,
+        userText,
+        aiText,
+        userName: chat[userIndex].name || context().name1 || '{{user}}',
+        aiName: chat[aiIndex].name || getCharacterName(),
+    };
+}
+
+function getAllChatExchanges() {
+    const chat = context().chat || [];
+    const pairs = [];
+    let waitingUserIndex = -1;
+
+    for (let i = 0; i < chat.length; i++) {
+        const message = chat[i];
+        if (!message || message.is_system) continue;
+        const text = stripHtml(message.mes);
+        if (!text) continue;
+        if (message.is_user) {
+            waitingUserIndex = i;
+            continue;
+        }
+        if (!message.is_user && waitingUserIndex >= 0 && !isRmfUtilityMessage(message)) {
+            const exchange = exchangeFromIndexes(chat, waitingUserIndex, i);
+            if (exchange) pairs.push(exchange);
+            waitingUserIndex = -1;
+        }
+    }
+
+    // 兼容部分导入记录：如果不是严格 user/assistant 交替，退回“每条 AI 找最近 user”的方式补全。
+    if (!pairs.length) {
+        for (let aiIndex = 0; aiIndex < chat.length; aiIndex++) {
+            const ai = chat[aiIndex];
+            if (!ai || ai.is_user || ai.is_system || isRmfUtilityMessage(ai) || !stripHtml(ai.mes)) continue;
+            let userIndex = -1;
+            for (let j = aiIndex - 1; j >= 0; j--) {
+                if (chat[j]?.is_user && !chat[j]?.is_system && stripHtml(chat[j]?.mes)) {
+                    userIndex = j;
+                    break;
+                }
+            }
+            if (userIndex >= 0) {
+                const exchange = exchangeFromIndexes(chat, userIndex, aiIndex);
+                if (exchange) pairs.push(exchange);
+            }
+        }
+    }
+    return pairs;
+}
+
 function getLatestExchange() {
     const chat = context().chat || [];
     let aiIndex = -1;
     for (let i = chat.length - 1; i >= 0; i--) {
         const m = chat[i];
-        if (m && !m.is_user && !m.is_system && stripHtml(m.mes)) {
+        if (m && !m.is_user && !m.is_system && !isRmfUtilityMessage(m) && stripHtml(m.mes)) {
             aiIndex = i;
             break;
         }
@@ -978,16 +1171,9 @@ function getLatestExchange() {
         }
     }
     if (userIndex < 0) return null;
-    return {
-        pairKey: `${userIndex}:${aiIndex}:${stripHtml(chat[userIndex].mes).slice(0, 60)}:${stripHtml(chat[aiIndex].mes).slice(0, 60)}`,
-        userIndex,
-        aiIndex,
-        userText: stripHtml(chat[userIndex].mes),
-        aiText: stripHtml(chat[aiIndex].mes),
-        userName: chat[userIndex].name || context().name1 || '{{user}}',
-        aiName: chat[aiIndex].name || getCharacterName(),
-    };
+    return exchangeFromIndexes(chat, userIndex, aiIndex);
 }
+
 
 let processing = false;
 let pendingProcess = false;
@@ -1034,7 +1220,9 @@ async function processLatestExchange({ force = false } = {}) {
         await maybeCreateChunkSummary(state);
         await maybeCreateMegaSummary(state);
         await saveState();
-        await writeWorldBook();
+        if (settings().autoSyncWorldBook) {
+            await writeWorldBook();
+        }
         await appendBriefToAiMessage(state.records.at(-1));
         refreshDashboard();
         updateStatus('记忆已更新。');
@@ -1175,41 +1363,31 @@ function updateStatus(text) {
     if (el) el.textContent = text;
 }
 
-async function rescanCurrentChat() {
+
+async function rescanCurrentChat({ confirmFirst = true, clearFirst = true, label = '历史聊天记录' } = {}) {
     const s = settings();
     if (!s.enabled) return toast('请先启用插件。', 'warning');
-    await clearCurrentMemory({ clearWorld: true, silent: true });
-    const chat = context().chat || [];
-    const pairs = [];
-    for (let aiIndex = 0; aiIndex < chat.length; aiIndex++) {
-        const ai = chat[aiIndex];
-        if (!ai || ai.is_user || ai.is_system || !stripHtml(ai.mes)) continue;
-        let userIndex = -1;
-        for (let j = aiIndex - 1; j >= 0; j--) {
-            if (chat[j]?.is_user && !chat[j]?.is_system && stripHtml(chat[j]?.mes)) {
-                userIndex = j;
-                break;
-            }
-        }
-        if (userIndex >= 0) {
-            pairs.push({ userIndex, aiIndex });
-        }
+    const pairs = getAllChatExchanges();
+    if (!pairs.length) return toast('没有找到可补录的 user/AI 对话轮。', 'warning');
+    if (confirmFirst) {
+        const ok = confirm(`即将从 0 层开始一键记忆 ${pairs.length} 轮${label}。\n\n这会调用总结模型逐轮补录，聊天越长耗时越久。是否开始？`);
+        if (!ok) return;
     }
-    toast(`开始补录 ${pairs.length} 轮聊天。`, 'info');
-    for (const pair of pairs) {
+
+    if (clearFirst) await clearCurrentMemory({ clearWorld: true, silent: true });
+    toast(`开始一键记忆 ${pairs.length} 轮${label}。`, 'info');
+    updateStatus(`历史补录准备中：0/${pairs.length}`);
+
+    const saveEvery = clampNumber(s.historyBatchSaveEvery, 1, 25, DEFAULT_SETTINGS.historyBatchSaveEvery);
+    let okCount = 0;
+    let failCount = 0;
+
+    for (let i = 0; i < pairs.length; i++) {
+        const exchange = pairs[i];
         const state = getState();
-        const exchange = {
-            pairKey: `${pair.userIndex}:${pair.aiIndex}:${stripHtml(chat[pair.userIndex].mes).slice(0, 60)}:${stripHtml(chat[pair.aiIndex].mes).slice(0, 60)}`,
-            userIndex: pair.userIndex,
-            aiIndex: pair.aiIndex,
-            userText: stripHtml(chat[pair.userIndex].mes),
-            aiText: stripHtml(chat[pair.aiIndex].mes),
-            userName: chat[pair.userIndex].name || context().name1 || '{{user}}',
-            aiName: chat[pair.aiIndex].name || getCharacterName(),
-        };
         if (state.processedPairs.includes(exchange.pairKey)) continue;
         try {
-            updateStatus(`补录中：${pairs.indexOf(pair) + 1}/${pairs.length}`);
+            updateStatus(`一键记忆历史聊天：${i + 1}/${pairs.length}`);
             const raw = await callMemoryModel(buildPairPrompt({ ...exchange, state }), { json: true });
             const json = parseJsonLoose(raw);
             const nextId = (state.records.at(-1)?.id || 0) + 1;
@@ -1226,16 +1404,139 @@ async function rescanCurrentChat() {
             });
             state.tracker = normalizeTracker(json.tracker, state.tracker);
             state.processedPairs.push(exchange.pairKey);
+            state.processedPairs = state.processedPairs.slice(-Math.max(200, s.maxRecordsStored));
+            state.records = state.records.slice(-clampNumber(s.maxRecordsStored, 50, 5000, DEFAULT_SETTINGS.maxRecordsStored));
             await maybeCreateChunkSummary(state);
             await maybeCreateMegaSummary(state);
-            await saveState();
+            okCount += 1;
+            if (okCount % saveEvery === 0) {
+                await saveState();
+                if (settings().autoSyncWorldBook) await writeWorldBook().catch((error) => warn('history sync failed', error));
+            }
         } catch (error) {
-            warn('rescan pair failed', pair, error);
+            failCount += 1;
+            warn('history rescan pair failed', exchange, error);
         }
     }
-    await writeWorldBook();
-    updateStatus('补录完成。');
-    toast('当前聊天补录完成。', 'success');
+
+    await saveState();
+    if (settings().autoSyncWorldBook) await writeWorldBook().catch((error) => warn('history final sync failed', error));
+    refreshDashboard();
+    updateStatus(`历史补录完成：成功 ${okCount}，失败 ${failCount}`);
+    toast(`历史聊天记忆完成：成功 ${okCount} 轮，失败 ${failCount} 轮。`, failCount ? 'warning' : 'success');
+}
+
+async function oneClickRememberHistory() {
+    return await rescanCurrentChat({ confirmFirst: true, clearFirst: true, label: '导入/历史聊天记录' });
+}
+
+function buildTranscriptForPrompt(exchanges) {
+    return exchanges.map((ex, index) => [
+        `【第 ${index + 1} 轮｜chat ${ex.userIndex}->${ex.aiIndex}】`,
+        `${ex.userName || 'User'}：${ex.userText}`,
+        `${ex.aiName || getCharacterName()}：${ex.aiText}`,
+    ].join('\n')).join('\n\n');
+}
+
+function chunkExchanges(exchanges, chunkPairs) {
+    const size = clampNumber(chunkPairs, 4, 60, DEFAULT_SETTINGS.walkThroughChunkPairs);
+    const chunks = [];
+    for (let i = 0; i < exchanges.length; i += size) {
+        chunks.push(exchanges.slice(i, i + size));
+    }
+    return chunks;
+}
+
+function buildWalkthroughChunkPrompt({ chunk, part, total }) {
+    return `你是 SillyTavern 角色卡聊天记录“走马灯回顾”整理器。请根据下面第 ${part}/${total} 段聊天，提取详细但不啰嗦的剧情概况。\n\n要求：\n1. 按时间顺序写清楚发生了什么。\n2. 保留人物关系变化、情绪变化、重要物品、承诺、世界设定、冲突和伏笔。\n3. 不要替 user 编造没说过的话，不要把推测写成事实。\n4. 输出 JSON。\n\n【聊天片段】\n${buildTranscriptForPrompt(chunk)}\n\n只输出 JSON：{\"overview\":\"这一段的详细概况\",\"keyFacts\":[\"关键事实1\"],\"relationships\":[\"关系变化1\"],\"openThreads\":[\"未解决事项1\"]}`;
+}
+
+function buildWalkthroughFinalPrompt({ state, overviews, totalPairs }) {
+    const memorySnapshot = JSON.stringify({
+        megaSummary: state.megaSummary,
+        summaries: state.summaries,
+        tracker: state.tracker,
+        recentRecords: state.records.slice(-20).map((r) => `#${r.id} ${r.brief}`),
+    }, null, 2);
+    const overviewText = overviews.map((x, i) => `## 第 ${i + 1} 段\n${x}`).join('\n\n');
+    return `你是 SillyTavern 角色卡聊天记录“走马灯回顾”整理器。请把下面的分段概况整合成一条可以直接作为 AI 回复发到聊天里的“完整走马灯回顾”。\n\n写法要求：\n- 中文，详细、清晰、有时间线。\n- 像在回放这张角色卡从第 0 层到现在的全部剧情。\n- 分成：总览、时间线、人物关系变化、角色状态/人物档案、世界设定/物品栏/约定、当前剧情停留点、后续可能发展、插件记忆测试点。\n- 不要写成 Markdown 表格。\n- 不要替 user 决定后续行动。\n- 可以用小标题和编号。\n\n【当前插件记忆状态】\n${memorySnapshot}\n\n【分段概况，共 ${totalPairs} 轮】\n${overviewText}\n\n请直接输出最终走马灯回顾正文。`;
+}
+
+function normalizeOverviewJson(raw) {
+    try {
+        const json = parseJsonLoose(raw);
+        const parts = [];
+        if (json.overview) parts.push(String(json.overview));
+        if (Array.isArray(json.keyFacts) && json.keyFacts.length) parts.push(`关键事实：${json.keyFacts.join('；')}`);
+        if (Array.isArray(json.relationships) && json.relationships.length) parts.push(`关系变化：${json.relationships.join('；')}`);
+        if (Array.isArray(json.openThreads) && json.openThreads.length) parts.push(`未解决事项：${json.openThreads.join('；')}`);
+        return parts.join('\n') || String(raw || '').trim();
+    } catch (_) {
+        return String(raw || '').trim();
+    }
+}
+
+async function addAssistantMessageToChat(content) {
+    const ctx = context();
+    const message = {
+        name: getCharacterName(),
+        is_user: false,
+        is_system: false,
+        mes: `${WALKTHROUGH_MARK}\n${content}\n${WALKTHROUGH_END}`,
+        send_date: Date.now(),
+        extra: { type: 'rmf_walkthrough', title: 'Role Memory Forge 走马灯回顾' },
+    };
+    if (typeof ctx.addOneMessage === 'function') {
+        await ctx.addOneMessage(message);
+    } else {
+        ctx.chat ||= [];
+        ctx.chat.push(message);
+        await saveChatAfterMessagePatch();
+        ctx.reloadCurrentChat?.();
+    }
+    await saveChatAfterMessagePatch();
+}
+
+async function generateWalkthrough() {
+    const s = settings();
+    if (!s.enabled) return toast('请先启用插件。', 'warning');
+    const allPairs = getAllChatExchanges();
+    if (!allPairs.length) return toast('没有找到可生成走马灯的聊天记录。', 'warning');
+    const maxPairs = clampNumber(s.walkThroughMaxPairs, 20, 1000, DEFAULT_SETTINGS.walkThroughMaxPairs);
+    const pairs = allPairs.length > maxPairs ? allPairs.slice(-maxPairs) : allPairs;
+    const skipped = allPairs.length - pairs.length;
+    const chunks = chunkExchanges(pairs, s.walkThroughChunkPairs);
+    const overviews = [];
+
+    const ok = confirm(`将生成“走马灯回顾”。\n\n检测到 ${allPairs.length} 轮聊天，本次会回顾 ${pairs.length} 轮${skipped > 0 ? `（前面 ${skipped} 轮因上限略过，可在设置里调高上限）` : ''}。\n这会调用模型 ${chunks.length + 1} 次。是否开始？`);
+    if (!ok) return;
+
+    updateStatus(`走马灯生成中：0/${chunks.length}`);
+    toast('开始生成走马灯回顾。', 'info');
+    for (let i = 0; i < chunks.length; i++) {
+        updateStatus(`走马灯分段整理：${i + 1}/${chunks.length}`);
+        const raw = await callMemoryModel(buildWalkthroughChunkPrompt({ chunk: chunks[i], part: i + 1, total: chunks.length }), { json: true });
+        overviews.push(normalizeOverviewJson(raw));
+    }
+
+    const state = getState();
+    updateStatus('走马灯最终整合中……');
+    let content = await callMemoryModel(buildWalkthroughFinalPrompt({ state, overviews, totalPairs: pairs.length }), { json: false });
+    content = String(content || '').trim();
+    if (!content) throw new Error('模型没有返回走马灯正文');
+    if (skipped > 0) {
+        content = `> 注：当前设置最多回顾 ${maxPairs} 轮，本次从较新的 ${pairs.length} 轮开始生成；想从最早 0 层完整回顾，请调高“走马灯最多回顾轮数”。\n\n${content}`;
+    }
+
+    state.walkthrough = { content, totalPairs: pairs.length, updatedAt: nowIso() };
+    await saveState();
+    if (settings().autoSyncWorldBook) await writeWorldBook().catch((error) => warn('walkthrough sync failed', error));
+    if (settings().walkThroughAddToChat) {
+        await addAssistantMessageToChat(content);
+    }
+    refreshDashboard();
+    updateStatus('走马灯回顾已生成。');
+    toast('走马灯回顾已生成。', 'success');
 }
 
 
@@ -1275,11 +1576,14 @@ function renderInlineEntry() {
         <div class="inline-drawer-content rmf-extension-content">
             <div class="rmf-extension-row">
                 <label class="checkbox_label"><input id="rmf_inline_enabled" type="checkbox"> 启用记忆</label>
+                <label class="checkbox_label"><input id="rmf_inline_autoSync" type="checkbox"> 自动同步世界书</label>
                 <label class="checkbox_label"><input id="rmf_inline_append" type="checkbox"> 回复结尾折叠简记</label>
             </div>
             <div class="rmf-extension-buttons">
                 <button id="rmf_inline_open" class="menu_button">打开记忆面板</button>
                 <button id="rmf_inline_process" class="menu_button">手动记录最新一轮</button>
+                <button id="rmf_inline_history" class="menu_button">一键记忆历史</button>
+                <button id="rmf_inline_walkthrough" class="menu_button">走马灯回顾</button>
                 <button id="rmf_inline_sync" class="menu_button">同步世界书</button>
             </div>
             <div id="rmf_inline_status" class="rmf-inline-status">悬浮球消失时，也可以从这里打开。</div>
@@ -1289,6 +1593,8 @@ function renderInlineEntry() {
 
     document.querySelector('#rmf_inline_open')?.addEventListener('click', openRmfPanel);
     document.querySelector('#rmf_inline_process')?.addEventListener('click', () => processLatestExchange({ force: true }));
+    document.querySelector('#rmf_inline_history')?.addEventListener('click', () => oneClickRememberHistory());
+    document.querySelector('#rmf_inline_walkthrough')?.addEventListener('click', () => generateWalkthrough().catch((error) => { warn('walkthrough failed', error); toast(`走马灯失败：${error.message}`, 'error'); updateStatus(`走马灯失败：${error.message}`); }));
     document.querySelector('#rmf_inline_sync')?.addEventListener('click', async () => {
         await writeWorldBook();
         toast('已同步到世界书。', 'success');
@@ -1307,6 +1613,11 @@ function renderInlineEntry() {
         refreshPanelValues();
         refreshDashboard();
     });
+    document.querySelector('#rmf_inline_autoSync')?.addEventListener('change', (event) => {
+        settings().autoSyncWorldBook = Boolean(event.target.checked);
+        saveSettings();
+        refreshPanelValues();
+    });
     document.querySelector('#rmf_inline_append')?.addEventListener('change', (event) => {
         settings().appendBriefToMessage = Boolean(event.target.checked);
         saveSettings();
@@ -1319,12 +1630,15 @@ function refreshInlineValues() {
     const s = settings();
     const enabled = document.querySelector('#rmf_inline_enabled');
     const append = document.querySelector('#rmf_inline_append');
+    const autoSync = document.querySelector('#rmf_inline_autoSync');
     const status = document.querySelector('#rmf_inline_status');
     if (enabled) enabled.checked = !!s.enabled;
     if (append) append.checked = !!s.appendBriefToMessage;
+    if (autoSync) autoSync.checked = !!s.autoSyncWorldBook;
     if (status) {
         const state = getStateSafe();
-        status.textContent = `状态：${s.enabled ? '已启用' : '未启用'}｜简记 ${state?.records?.length || 0} 条｜世界书 ${state?.worldName || getWorldNameSafe()}`;
+        const target = getWorldTargetLabel();
+        status.textContent = `状态：${s.enabled ? '已启用' : '未启用'}｜简记 ${state?.records?.length || 0} 条｜同步目标：${target}`;
     }
 }
 
@@ -1333,7 +1647,16 @@ function getStateSafe() {
 }
 
 function getWorldNameSafe() {
-    try { return getWorldName(); } catch (_) { return 'RMF-记忆世界书'; }
+    try { return getWorldName(); } catch (_) { return '未检测到角色卡自带世界书'; }
+}
+
+function getWorldTargetLabel() {
+    try {
+        const target = resolveWorldBookTarget({ allowFallback: true });
+        return target.worldName ? `${target.source}：${target.worldName}` : target.source;
+    } catch (_) {
+        return getWorldNameSafe();
+    }
 }
 
 function renderSettingsPanel() {
@@ -1368,6 +1691,7 @@ function renderSettingsPanel() {
             <div class="rmf-quick-row">
                 <label class="rmf-switch"><input id="rmf_enabled" type="checkbox"><span></span><b>启用记忆</b></label>
                 <label class="rmf-switch"><input id="rmf_auto" type="checkbox"><span></span><b>AI 回复后实时填表</b></label>
+                <label class="rmf-switch"><input id="rmf_autoSyncWorldBook" type="checkbox"><span></span><b>自动同步到世界书</b></label>
                 <label class="rmf-switch"><input id="rmf_appendBrief" type="checkbox"><span></span><b>回复结尾折叠简记</b></label>
                 <label class="rmf-switch"><input id="rmf_keep" type="checkbox"><span></span><b>新聊天保留记忆</b></label>
             </div>
@@ -1431,6 +1755,22 @@ function renderSettingsPanel() {
                     </details>
 
                     <details open class="rmf-section">
+                        <summary>历史补录与走马灯</summary>
+                        <div class="rmf-grid">
+                            <label>历史补录每几轮保存一次
+                                <input id="rmf_historyBatchSaveEvery" type="number" min="1" max="25">
+                            </label>
+                            <label>走马灯每段处理轮数
+                                <input id="rmf_walkThroughChunkPairs" type="number" min="4" max="60">
+                            </label>
+                            <label>走马灯最多回顾轮数
+                                <input id="rmf_walkThroughMaxPairs" type="number" min="20" max="1000">
+                            </label>
+                            <label class="rmf-checkline"><input id="rmf_walkThroughAddToChat" type="checkbox"> 走马灯生成后作为 AI 回复写入聊天</label>
+                        </div>
+                    </details>
+
+                    <details open class="rmf-section">
                         <summary>显示与世界书</summary>
                         <div class="rmf-grid">
                             <label>折叠简记标题
@@ -1439,9 +1779,17 @@ function renderSettingsPanel() {
                             <label>关系图最多节点
                                 <input id="rmf_relationGraphMaxNodes" type="number" min="4" max="24">
                             </label>
-                            <label>世界书命名模板
-                                <input id="rmf_worldNameTemplate" type="text" placeholder="RMF-{{char}}-记忆世界书">
+                            <label>世界书同步目标
+                                <select id="rmf_worldSyncMode">
+                                    <option value="character">角色卡自带世界书（推荐，不新建）</option>
+                                    <option value="selected">当前选中的世界书（不新建）</option>
+                                    <option value="custom">自定义 RMF 世界书（允许新建）</option>
+                                </select>
                             </label>
+                            <label>自定义世界书模板
+                                <input id="rmf_worldNameTemplate" type="text" placeholder="仅在自定义模式使用：RMF-{{char}}-记忆世界书">
+                            </label>
+                            <label class="rmf-checkline"><input id="rmf_allowCreateFallbackWorldBook" type="checkbox"> 找不到角色卡世界书时允许新建 RMF 世界书</label>
                             <label class="rmf-checkline"><input id="rmf_cleanup" type="checkbox"> 关闭插件时清理当前记忆</label>
                             <label class="rmf-checkline"><input id="rmf_toast" type="checkbox"> 显示提示消息</label>
                             <label class="rmf-checkline"><input id="rmf_raw" type="checkbox"> 保存 JSON_RAW 世界书条目</label>
@@ -1450,13 +1798,15 @@ function renderSettingsPanel() {
 
                     <div class="rmf-actions">
                         <button id="rmf_process" class="menu_button">手动记录最新一轮</button>
-                        <button id="rmf_rescan" class="menu_button">补录当前聊天</button>
+                        <button id="rmf_history" class="menu_button rmf-primary-action">一键记忆历史聊天记录</button>
+                        <button id="rmf_walkthrough" class="menu_button rmf-primary-action">走马灯回顾</button>
+                        <button id="rmf_rescan" class="menu_button">重新补录当前聊天</button>
                         <button id="rmf_sync" class="menu_button">同步到世界书</button>
                         <button id="rmf_export" class="menu_button">导出 JSON</button>
                         <button id="rmf_clear" class="menu_button danger">清空当前记忆</button>
                     </div>
 
-                    <div class="rmf-note">提示：折叠简记会追加到 AI 最新回复末尾；人物关系、状态、档案、物品栏等都会以 RMF Index JSON 二维数组格式同步到世界书。自填 API Key 会保存在 ST 扩展设置里；更安全的方式是选择“使用 SillyTavern 当前 API”。浏览器直连某些 API 可能被 CORS 拦截。</div>
+                    <div class="rmf-note">提示：默认直接写入“角色卡自带世界书”，不会额外新开 RMF 世界书；导入别人的旧聊天记录后，点“一键记忆历史聊天记录”即可从 0 层补录到当前；点“走马灯回顾”会让模型整理一条从开头到当前的详细剧情回放，并可作为 AI 回复写入聊天，用来测试记忆是否有效。</div>
                 </main>
             </div>
         </section>
@@ -1487,6 +1837,7 @@ function bindPanelEvents() {
         rmf_keep: ['keepAcrossNewChats', 'checked'],
         rmf_cleanup: ['cleanupWhenDisabled', 'checked'],
         rmf_auto: ['autoProcess', 'checked'],
+        rmf_autoSyncWorldBook: ['autoSyncWorldBook', 'checked'],
         rmf_appendBrief: ['appendBriefToMessage', 'checked'],
         rmf_toast: ['showToast', 'checked'],
         rmf_raw: ['includeRawJsonEntry', 'checked'],
@@ -1504,6 +1855,12 @@ function bindPanelEvents() {
         rmf_maxRecordsStored: ['maxRecordsStored', 'value'],
         rmf_briefFoldTitle: ['briefFoldTitle', 'value'],
         rmf_relationGraphMaxNodes: ['relationGraphMaxNodes', 'value'],
+        rmf_historyBatchSaveEvery: ['historyBatchSaveEvery', 'value'],
+        rmf_walkThroughChunkPairs: ['walkThroughChunkPairs', 'value'],
+        rmf_walkThroughMaxPairs: ['walkThroughMaxPairs', 'value'],
+        rmf_walkThroughAddToChat: ['walkThroughAddToChat', 'checked'],
+        rmf_worldSyncMode: ['worldSyncMode', 'value'],
+        rmf_allowCreateFallbackWorldBook: ['allowCreateFallbackWorldBook', 'checked'],
         rmf_worldNameTemplate: ['worldNameTemplate', 'value'],
     };
     for (const [id, [key, prop]] of Object.entries(map)) {
@@ -1524,6 +1881,14 @@ function bindPanelEvents() {
                     refreshPromptInjection();
                 }
             } else {
+                if (['worldSyncMode', 'worldNameTemplate', 'allowCreateFallbackWorldBook'].includes(key)) {
+                    const target = resolveWorldBookTarget({ allowFallback: true });
+                    const state = getState();
+                    state.worldName = target.worldName || '';
+                    state.worldSource = target.source;
+                    await saveState();
+                    if (settings().autoSyncWorldBook && target.worldName) await writeWorldBook().catch((error) => warn('writeWorldBook after target change failed', error));
+                }
                 refreshPromptInjection();
             }
             refreshDashboard();
@@ -1531,6 +1896,8 @@ function bindPanelEvents() {
     }
 
     document.querySelector('#rmf_process')?.addEventListener('click', () => processLatestExchange({ force: true }));
+    document.querySelector('#rmf_history')?.addEventListener('click', () => oneClickRememberHistory());
+    document.querySelector('#rmf_walkthrough')?.addEventListener('click', () => generateWalkthrough().catch((error) => { warn('walkthrough failed', error); toast(`走马灯失败：${error.message}`, 'error'); updateStatus(`走马灯失败：${error.message}`); }));
     document.querySelector('#rmf_rescan')?.addEventListener('click', () => rescanCurrentChat());
     document.querySelector('#rmf_sync')?.addEventListener('click', async () => {
         await writeWorldBook();
@@ -1553,6 +1920,7 @@ function refreshPanelValues() {
     set('rmf_keep', !!s.keepAcrossNewChats, 'checked');
     set('rmf_cleanup', !!s.cleanupWhenDisabled, 'checked');
     set('rmf_auto', !!s.autoProcess, 'checked');
+    set('rmf_autoSyncWorldBook', !!s.autoSyncWorldBook, 'checked');
     set('rmf_appendBrief', !!s.appendBriefToMessage, 'checked');
     set('rmf_toast', !!s.showToast, 'checked');
     set('rmf_raw', !!s.includeRawJsonEntry, 'checked');
@@ -1570,6 +1938,12 @@ function refreshPanelValues() {
     set('rmf_maxRecordsStored', s.maxRecordsStored);
     set('rmf_briefFoldTitle', s.briefFoldTitle);
     set('rmf_relationGraphMaxNodes', s.relationGraphMaxNodes);
+    set('rmf_historyBatchSaveEvery', s.historyBatchSaveEvery);
+    set('rmf_walkThroughChunkPairs', s.walkThroughChunkPairs);
+    set('rmf_walkThroughMaxPairs', s.walkThroughMaxPairs);
+    set('rmf_walkThroughAddToChat', !!s.walkThroughAddToChat, 'checked');
+    set('rmf_worldSyncMode', s.worldSyncMode || 'character');
+    set('rmf_allowCreateFallbackWorldBook', !!s.allowCreateFallbackWorldBook, 'checked');
     set('rmf_worldNameTemplate', s.worldNameTemplate);
     refreshInlineValues();
 }
@@ -1724,10 +2098,11 @@ function refreshDashboard() {
     if (!el) return;
     el.innerHTML = `
         <div class="rmf-statline">
-            <span>世界书 <b>${escapeForHtml(state.worldName || getWorldName())}</b></span>
+            <span>同步目标 <b>${escapeForHtml(getWorldTargetLabel())}</b></span>
             <span>简记 <b>${state.records.length}</b></span>
             <span>阶段总结 <b>${state.summaries.length}</b> / 未合并 <b>${pending}</b></span>
             <span>大总结 <b>${state.megaSummary.content ? '有' : '无'}</b></span>
+            <span>走马灯 <b>${state.walkthrough?.content ? '有' : '无'}</b></span>
         </div>
         ${state.lastError ? `<div class="rmf-error">${escapeForHtml(state.lastError)}</div>` : ''}
         <details open class="rmf-dash-block">
@@ -1742,6 +2117,10 @@ function refreshDashboard() {
         <details class="rmf-dash-block">
             <summary>发展方向</summary>
             <div class="rmf-text-box">${escapeForHtml(state.tracker.development || '暂无')}</div>
+        </details>
+        <details class="rmf-dash-block">
+            <summary>走马灯回顾</summary>
+            <div class="rmf-text-box">${escapeForHtml(state.walkthrough?.content || '暂无。点击“走马灯回顾”后会生成。')}</div>
         </details>
         <details class="rmf-dash-block">
             <summary>最近简记</summary>
