@@ -7,7 +7,7 @@
   "js": "index.js",
   "css": "style.css",
   "author": "OpenAI / 丁浩 custom build",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "homePage": "https://github.com/your-name/SillyTavern-RoleMemoryForge",
   "auto_update": true,
   "minimum_client_version": "1.14.0",
@@ -18,5 +18,5 @@
     "disable": "onDisable",
     "clean": "onClean"
   },
-  "description": "SillyTavern roleplay memory extension with layered summaries, floating dashboard, relation graph, world-book sync, and folded brief notes."
+  "description": "SillyTavern roleplay memory extension with layered summaries, floating dashboard, RMF Index database tables, relation graph, world-book sync, and folded brief notes."
 }

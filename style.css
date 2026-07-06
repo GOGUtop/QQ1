@@ -592,3 +592,89 @@
         height: 260px;
     }
 }
+
+/* v0.3.0 — RMF Index 数据库表格视图 */
+.rmf-index-stack {
+    display: grid;
+    gap: 10px;
+}
+
+.rmf-index-table-card {
+    border: 1px solid rgba(107, 211, 255, .18);
+    border-radius: 16px;
+    background:
+        radial-gradient(circle at 0% 0%, rgba(78, 204, 255, .10), transparent 34%),
+        rgba(0, 0, 0, .16);
+    overflow: hidden;
+}
+
+.rmf-index-title {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    padding: 9px 10px;
+    border-bottom: 1px solid rgba(255,255,255,.08);
+    background: linear-gradient(90deg, rgba(75, 190, 255, .12), rgba(166, 103, 255, .10));
+}
+
+.rmf-index-title b {
+    color: #dff9ff;
+    letter-spacing: .2px;
+}
+
+.rmf-index-title span {
+    flex: 0 0 auto;
+    padding: 2px 7px;
+    border-radius: 999px;
+    font-size: 10px;
+    font-weight: 800;
+    color: #aeefff;
+    border: 1px solid rgba(130, 224, 255, .20);
+    background: rgba(70, 183, 255, .10);
+}
+
+.rmf-index-scroll {
+    overflow: auto;
+    max-height: 260px;
+}
+
+.rmf-index-table-card table {
+    width: 100%;
+    border-collapse: separate;
+    border-spacing: 0;
+    font-size: 12px;
+}
+
+.rmf-index-table-card th,
+.rmf-index-table-card td {
+    padding: 7px 8px;
+    border-bottom: 1px solid rgba(255,255,255,.065);
+    border-right: 1px solid rgba(255,255,255,.045);
+    text-align: left;
+    vertical-align: top;
+    min-width: 72px;
+    max-width: 260px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.rmf-index-table-card th {
+    position: sticky;
+    top: 0;
+    z-index: 1;
+    color: #9cecff;
+    font-weight: 900;
+    background: rgba(18, 34, 60, .96);
+}
+
+.rmf-index-table-card tbody tr:hover td {
+    background: rgba(86, 204, 255, .08);
+}
+
+.rmf-index-more {
+    padding: 7px 10px;
+    opacity: .62;
+    font-size: 11px;
+}

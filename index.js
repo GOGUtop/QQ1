@@ -20,6 +20,8 @@ const RAW_ENTRY_COMMENT = `${ENTRY_MARK} 99 JSON_RAW_DO_NOT_EDIT`;
 const DASHBOARD_ENTRY_COMMENT = `${ENTRY_MARK} 00 当前记忆总览`;
 const RECORDS_ENTRY_COMMENT = `${ENTRY_MARK} 01 每层简记流水`;
 const RELATION_ENTRY_COMMENT = `${ENTRY_MARK} 02 可视化关系表`;
+const INDEX_ENTRY_COMMENT = `${ENTRY_MARK} 03 RMF_INDEX_DATABASE`;
+const WORLD_ENTRY_COMMENT = `${ENTRY_MARK} 04 状态档案设定表`;
 
 const DEFAULT_SETTINGS = Object.freeze({
     enabled: false,
@@ -160,7 +162,7 @@ function createEmptyTracker() {
         promises: [],
         currentPlot: '',
         development: '',
-        relationTableMarkdown: '| 人物A | 人物B | 关系 | 当前状态 | 证据 |\n|---|---|---|---|---|',
+        relationIndexFormat: '',
     };
 }
 
@@ -337,6 +339,8 @@ async function writeWorldBook() {
     upsertEntry(data, DASHBOARD_ENTRY_COMMENT, buildWorldBookDashboard(state), 10);
     upsertEntry(data, RECORDS_ENTRY_COMMENT, buildRecordsBook(state), 20);
     upsertEntry(data, RELATION_ENTRY_COMMENT, buildRelationBook(state), 30);
+    upsertEntry(data, INDEX_ENTRY_COMMENT, buildIndexDatabaseBook(state), 40);
+    upsertEntry(data, WORLD_ENTRY_COMMENT, buildStateTablesBook(state), 50);
 
     if (settings().includeRawJsonEntry) {
         upsertEntry(data, RAW_ENTRY_COMMENT, `\`\`\`json\n${JSON.stringify(state, null, 2)}\n\`\`\``, 999);
@@ -423,14 +427,54 @@ function buildRecordsBook(state) {
 
 function buildRelationBook(state) {
     return [
-        '# 可视化关系表',
-        state.tracker.relationTableMarkdown || buildRelationMarkdown(state.tracker.relationships),
+        '# RMF 可视化关系网络',
+        '说明：本条目不再使用 Markdown 文字表格，统一使用 RMF Index JSON 二维数组格式，方便插件界面和其他数据库插件读取。',
         '',
-        '## Mermaid 关系图',
+        '## 人物关系表 / RMF Index',
+        toIndexTableText(buildRelationIndexTable(state)),
+        '',
+        '## 关系图节点 / RMF Index',
+        toIndexTableText(buildGraphNodeIndexTable(state)),
+        '',
+        '## 关系图边 / RMF Index',
+        toIndexTableText(buildGraphEdgeIndexTable(state)),
+        '',
+        '## Mermaid 兼容预览',
         '```mermaid',
         buildMermaid(state.tracker.relationships),
         '```',
-    ].join('\n');
+    ].join('
+');
+}
+
+function buildIndexDatabaseBook(state) {
+    return [
+        '# RMF Index Database',
+        'FORMAT: RMF_INDEX_TABLE / JSON_2D_ARRAY',
+        '说明：每个表都以二维数组保存；第一行为字段名，后续为数据行。',
+        '',
+        ...buildAllIndexTables(state).map((table) => toIndexTableText(table)),
+    ].join('
+
+');
+}
+
+function buildStateTablesBook(state) {
+    return [
+        '# RMF 状态档案设定表',
+        toIndexTableText(buildCharacterStateIndexTable(state)),
+        '',
+        toIndexTableText(buildProfileIndexTable(state)),
+        '',
+        toIndexTableText(buildWorldSettingIndexTable(state)),
+        '',
+        toIndexTableText(buildInventoryIndexTable(state)),
+        '',
+        toIndexTableText(buildPromiseIndexTable(state)),
+        '',
+        toIndexTableText(buildPlotIndexTable(state)),
+    ].join('
+');
 }
 
 function objectToBulletList(obj) {
@@ -441,6 +485,149 @@ function objectToBulletList(obj) {
 function arrayToBulletList(arr) {
     if (!Array.isArray(arr) || !arr.length) return '暂无。';
     return arr.map((x) => `- ${typeof x === 'string' ? x : JSON.stringify(x)}`).join('\n');
+}
+
+
+function safeCell(value, max = 600) {
+    if (value === null || value === undefined) return '';
+    if (Array.isArray(value)) return value.map((x) => safeCell(x, 120)).filter(Boolean).join('；');
+    if (typeof value === 'object') return JSON.stringify(value);
+    return String(value).replace(/\s+/g, ' ').trim().slice(0, max);
+}
+
+function makeIndexTable(name, columns, rows = []) {
+    return {
+        name,
+        mode: 'JSON_2D_ARRAY',
+        columns,
+        rows: rows.map((row) => columns.map((_, index) => safeCell(row[index] ?? ''))),
+        updatedAt: nowIso(),
+    };
+}
+
+function index2D(table) {
+    return [table.columns, ...table.rows];
+}
+
+function toIndexTableText(table) {
+    return [
+        `<RMF_INDEX_TABLE name="${safeCell(table.name, 80)}" mode="${table.mode || 'JSON_2D_ARRAY'}" updated="${safeCell(table.updatedAt || nowIso(), 40)}">`,
+        JSON.stringify(index2D(table), null, 2),
+        '</RMF_INDEX_TABLE>',
+    ].join('\n');
+}
+
+function buildRelationIndexTable(state = getState()) {
+    const rows = (Array.isArray(state?.tracker?.relationships) ? state.tracker.relationships : []).map((r, index) => [
+        index + 1,
+        r.from || '',
+        r.to || '',
+        r.relation || '',
+        r.attitude || r.status || '',
+        Number.isFinite(Number(r.tension)) ? Number(r.tension) : '',
+        r.evidence || '',
+    ]);
+    return makeIndexTable('人物关系表', ['序号', '人物A', '人物B', '关系', '当前状态', '张力值', '证据'], rows);
+}
+
+function buildCharacterStateIndexTable(state = getState()) {
+    const rows = Object.entries(state?.tracker?.characterStates || {}).map(([name, value], index) => [index + 1, name, value]);
+    return makeIndexTable('角色状态表', ['序号', '角色', '状态'], rows);
+}
+
+function buildProfileIndexTable(state = getState()) {
+    const rows = Object.entries(state?.tracker?.profiles || {}).map(([name, value], index) => [index + 1, name, value]);
+    return makeIndexTable('人物档案表', ['序号', '人物', '档案'], rows);
+}
+
+function buildWorldSettingIndexTable(state = getState()) {
+    const rows = (Array.isArray(state?.tracker?.worldSetting) ? state.tracker.worldSetting : []).map((value, index) => [index + 1, value]);
+    return makeIndexTable('世界设定表', ['序号', '设定'], rows);
+}
+
+function buildInventoryIndexTable(state = getState()) {
+    const inventory = state?.tracker?.inventory || {};
+    const rows = Object.entries(inventory).flatMap(([owner, items]) => {
+        const list = Array.isArray(items) ? items : [items];
+        return list.map((item, i) => [owner, i + 1, item]);
+    });
+    return makeIndexTable('物品栏表', ['持有人', '序号', '物品/线索'], rows);
+}
+
+function buildPromiseIndexTable(state = getState()) {
+    const rows = (Array.isArray(state?.tracker?.promises) ? state.tracker.promises : []).map((value, index) => [index + 1, value]);
+    return makeIndexTable('约定表', ['序号', '约定/未完成事项'], rows);
+}
+
+function buildPlotIndexTable(state = getState()) {
+    return makeIndexTable('剧情进度表', ['项目', '内容'], [
+        ['当前剧情', state?.tracker?.currentPlot || ''],
+        ['发展方向', state?.tracker?.development || ''],
+        ['大总结覆盖到简记', state?.megaSummary?.coversRecordId || 0],
+        ['世界书', state?.worldName || getWorldName()],
+    ]);
+}
+
+function buildRecordIndexTable(state = getState()) {
+    const rows = (Array.isArray(state?.records) ? state.records : []).slice(-80).map((r) => [
+        r.id,
+        r.userName || '{{user}}',
+        r.aiName || getCharacterName(),
+        r.brief || '',
+        r.createdAt || '',
+    ]);
+    return makeIndexTable('简记流水表', ['层号', '用户', 'AI', '简记', '时间'], rows);
+}
+
+function buildSummaryIndexTable(state = getState()) {
+    const rows = (Array.isArray(state?.summaries) ? state.summaries : []).map((r) => [
+        r.id,
+        `${r.startRecordId || 0}-${r.endRecordId || 0}`,
+        r.consolidated ? '已进入大总结' : '未合并',
+        r.content || '',
+        r.createdAt || '',
+    ]);
+    return makeIndexTable('阶段总结表', ['编号', '覆盖简记', '状态', '总结', '时间'], rows);
+}
+
+function buildGraphNodeIndexTable(state = getState()) {
+    const graph = collectRelationGraph(state);
+    const rows = graph.all.map((name, index) => [index + 1, name, name === graph.center ? '中心' : '外围', avatarUrlForName(name) || '']);
+    return makeIndexTable('关系图节点表', ['序号', '人物', '节点类型', '头像'], rows);
+}
+
+function buildGraphEdgeIndexTable(state = getState()) {
+    const graph = collectRelationGraph(state);
+    const rows = graph.edges.map((r, index) => [
+        index + 1,
+        r.from || '',
+        r.to || '',
+        r.relation || '',
+        r.attitude || r.status || '',
+        Number.isFinite(Number(r.tension)) ? Number(r.tension) : '',
+    ]);
+    return makeIndexTable('关系图连线表', ['序号', '起点', '终点', '关系标签', '状态', '张力值'], rows);
+}
+
+function buildAllIndexTables(state = getState()) {
+    return [
+        buildRelationIndexTable(state),
+        buildGraphNodeIndexTable(state),
+        buildGraphEdgeIndexTable(state),
+        buildCharacterStateIndexTable(state),
+        buildProfileIndexTable(state),
+        buildWorldSettingIndexTable(state),
+        buildInventoryIndexTable(state),
+        buildPromiseIndexTable(state),
+        buildPlotIndexTable(state),
+        buildRecordIndexTable(state),
+        buildSummaryIndexTable(state),
+    ];
+}
+
+function compactIndexTableForPrompt(table, maxRows = 24) {
+    const compact = { ...table, rows: table.rows.slice(0, maxRows) };
+    return toIndexTableText(compact);
 }
 
 function buildRelationMarkdown(relationships = []) {
@@ -502,7 +689,7 @@ function buildInjectionText(state = getState()) {
         objectToBulletList(state.tracker.characterStates),
         '',
         '【人物关系】',
-        state.tracker.relationTableMarkdown || buildRelationMarkdown(state.tracker.relationships),
+        compactIndexTableForPrompt(buildRelationIndexTable(state)),
         '',
         '【世界设定/物品/约定】',
         `世界设定：${Array.isArray(state.tracker.worldSetting) ? state.tracker.worldSetting.join('；') : '暂无'}`,
@@ -624,7 +811,8 @@ async function callOpenAICompatible(prompt, { json = true } = {}) {
 }
 
 function buildPairPrompt({ userText, aiText, state }) {
-    return `你是 SillyTavern 角色扮演记忆插件的“实时填表器”。请根据【最新一轮对话】更新记忆。\n\n规则：\n1. 只记录已经发生、已经明确的信息；不要脑补，不要讨好 user，不要写“可能/似乎”。\n2. brief 用 1-2 句中文概括本轮，不写废话。\n3. tracker 必须返回“完整更新后的状态”，不是增量。\n4. 人物关系要保留矛盾、距离、亲密度变化、承诺、物品归属。\n5. 做爱/亲密行为只作为普通事件记录，不默认等于恋爱、告白或攻略成功，除非对话明确说明。\n\n【旧 tracker】\n${JSON.stringify(state.tracker || createEmptyTracker(), null, 2)}\n\n【最新一轮对话】\nUser：${userText}\nAI：${aiText}\n\n请只输出 JSON：\n{\n  "brief": "本轮简记",\n  "tracker": {\n    "characterStates": {"角色名":"当前身体/情绪/位置/目标等状态"},\n    "profiles": {"角色名":"稳定人物档案和已知事实"},\n    "relationships": [{"from":"人物A","to":"人物B","relation":"关系类型","attitude":"当前关系状态/张力","tension":0,"evidence":"证据"}],\n    "worldSetting": ["世界设定/地点/规则"],\n    "inventory": {"持有人":["物品/线索"]},\n    "promises": ["约定/未完成事项"],\n    "currentPlot": "当前剧情位置和正在发生的事",\n    "development": "自然的发展方向，不要替 user 决定行动",\n    "relationTableMarkdown": "markdown 表格"\n  }\n}`;
+    return `你是 SillyTavern 角色扮演记忆插件的“实时填表器”。请根据【最新一轮对话】更新记忆。\n\n规则：\n1. 只记录已经发生、已经明确的信息；不要脑补，不要讨好 user，不要写“可能/似乎”。\n2. brief 用 1-2 句中文概括本轮，不写废话。\n3. tracker 必须返回“完整更新后的状态”，不是增量。\n4. 人物关系要保留矛盾、距离、亲密度变化、承诺、物品归属。\n5. 做爱/亲密行为只作为普通事件记录，不默认等于恋爱、告白或攻略成功，除非对话明确说明。
+6. 不要返回 Markdown 表格；人物关系只放进 relationships 数组，插件会自动转成 RMF Index JSON 二维数组。\n\n【旧 tracker】\n${JSON.stringify(state.tracker || createEmptyTracker(), null, 2)}\n\n【最新一轮对话】\nUser：${userText}\nAI：${aiText}\n\n请只输出 JSON：\n{\n  "brief": "本轮简记",\n  "tracker": {\n    "characterStates": {"角色名":"当前身体/情绪/位置/目标等状态"},\n    "profiles": {"角色名":"稳定人物档案和已知事实"},\n    "relationships": [{"from":"人物A","to":"人物B","relation":"关系类型","attitude":"当前关系状态/张力","tension":0,"evidence":"证据"}],\n    "worldSetting": ["世界设定/地点/规则"],\n    "inventory": {"持有人":["物品/线索"]},\n    "promises": ["约定/未完成事项"],\n    "currentPlot": "当前剧情位置和正在发生的事",\n    "development": "自然的发展方向，不要替 user 决定行动"\n  }\n}`;
 }
 
 function buildChunkSummaryPrompt(records) {
@@ -742,7 +930,7 @@ function normalizeTracker(next, previous) {
     merged.promises = Array.isArray(merged.promises) ? merged.promises : [];
     merged.currentPlot = String(merged.currentPlot || '');
     merged.development = String(merged.development || '');
-    merged.relationTableMarkdown = String(merged.relationTableMarkdown || buildRelationMarkdown(merged.relationships));
+    merged.relationIndexFormat = 'RMF_INDEX_TABLE/JSON_2D_ARRAY';
     return merged;
 }
 
@@ -930,7 +1118,7 @@ function renderSettingsPanel() {
                 <div class="rmf-orb">✦</div>
                 <div class="rmf-titlebox">
                     <strong>Role Memory Forge</strong>
-                    <small>分层总结 / 实时填表 / 关系网络 / 世界书记忆</small>
+                    <small>分层总结 / 实时填表 / RMF Index 数据库 / 世界书记忆</small>
                 </div>
                 <span id="rmf_status" class="rmf-status">待机</span>
                 <button id="rmf_close" class="rmf-icon-btn" title="关闭">×</button>
@@ -1027,7 +1215,7 @@ function renderSettingsPanel() {
                         <button id="rmf_clear" class="menu_button danger">清空当前记忆</button>
                     </div>
 
-                    <div class="rmf-note">提示：折叠简记会追加到 AI 最新回复末尾；如不想增加聊天正文长度，可以关闭“回复结尾折叠简记”。自填 API Key 会保存在 ST 扩展设置里；更安全的方式是选择“使用 SillyTavern 当前 API”。浏览器直连某些 API 可能被 CORS 拦截。</div>
+                    <div class="rmf-note">提示：折叠简记会追加到 AI 最新回复末尾；人物关系、状态、档案、物品栏等都会以 RMF Index JSON 二维数组格式同步到世界书。自填 API Key 会保存在 ST 扩展设置里；更安全的方式是选择“使用 SillyTavern 当前 API”。浏览器直连某些 API 可能被 CORS 拦截。</div>
                 </main>
             </div>
         </section>
@@ -1261,6 +1449,30 @@ function buildRelationshipCards(state) {
         </div>`).join('');
 }
 
+
+function renderIndexTableHtml(table, { compact = true } = {}) {
+    const rows = compact ? table.rows.slice(0, 12) : table.rows;
+    const header = table.columns.map((c) => `<th>${escapeForHtml(c)}</th>`).join('');
+    const body = rows.map((row) => `<tr>${table.columns.map((_, i) => `<td>${escapeForHtml(row[i] ?? '')}</td>`).join('')}</tr>`).join('') || `<tr><td colspan="${table.columns.length}">暂无数据</td></tr>`;
+    const more = table.rows.length > rows.length ? `<div class="rmf-index-more">已显示 ${rows.length}/${table.rows.length} 行，完整内容会同步到世界书。</div>` : '';
+    return `<div class="rmf-index-table-card">
+        <div class="rmf-index-title"><b>${escapeForHtml(table.name)}</b><span>${escapeForHtml(table.mode || 'JSON_2D_ARRAY')}</span></div>
+        <div class="rmf-index-scroll"><table><thead><tr>${header}</tr></thead><tbody>${body}</tbody></table></div>
+        ${more}
+    </div>`;
+}
+
+function buildIndexTablesHtml(state) {
+    const tables = [
+        buildRelationIndexTable(state),
+        buildCharacterStateIndexTable(state),
+        buildProfileIndexTable(state),
+        buildInventoryIndexTable(state),
+        buildPlotIndexTable(state),
+    ];
+    return `<div class="rmf-index-stack">${tables.map((table) => renderIndexTableHtml(table)).join('')}</div>`;
+}
+
 function refreshDashboard() {
     const el = document.querySelector('#rmf_dashboard');
     const badge = document.querySelector('#rmf_float_badge');
@@ -1299,9 +1511,9 @@ function refreshDashboard() {
             <summary>最近简记</summary>
             <ol class="rmf-record-list">${state.records.slice(-8).map((r) => `<li><b>#${r.id}</b> ${escapeForHtml(r.brief)}</li>`).join('') || '<li>暂无</li>'}</ol>
         </details>
-        <details class="rmf-dash-block">
-            <summary>人物关系 Markdown</summary>
-            <pre>${escapeForHtml(state.tracker.relationTableMarkdown || buildRelationMarkdown(state.tracker.relationships))}</pre>
+        <details open class="rmf-dash-block">
+            <summary>Index 数据表</summary>
+            ${buildIndexTablesHtml(state)}
         </details>
         <details class="rmf-dash-block">
             <summary>大总结</summary>
