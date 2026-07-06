@@ -1,16 +1,155 @@
-import {
-    extension_prompt_roles,
-    extension_prompt_types,
-    generateQuietPrompt,
-} from '../../../../script.js';
+// Role Memory Forge v0.3.1
+// 这一版不再使用会直接炸掉插件的静态 import。
+// SillyTavern 内部模块路径有时会随版本变化，静态 import 一旦失败，悬浮球和入口都会消失。
+// 这里改为：先渲染 UI，再动态按需加载 ST API / WorldInfo API。
 
-import {
-    createNewWorldInfo,
-    createWorldInfoEntry,
-    loadWorldInfo,
-    saveWorldInfo,
-    updateWorldInfoList,
-} from '../../../world-info.js';
+const extension_prompt_types = { NONE: -1, IN_PROMPT: 0, IN_CHAT: 1, BEFORE_PROMPT: 2 };
+const extension_prompt_roles = { SYSTEM: 0, USER: 1, ASSISTANT: 2 };
+
+let scriptModulePromise = null;
+let worldInfoModulePromise = null;
+let csrfTokenPromise = null;
+
+async function importFirst(urls) {
+    for (const url of urls) {
+        try {
+            return await import(url);
+        } catch (error) {
+            console.warn('[Role Memory Forge] dynamic import failed:', url, error);
+        }
+    }
+    return null;
+}
+
+async function getScriptModule() {
+    if (!scriptModulePromise) {
+        scriptModulePromise = importFirst(['../../../../script.js', '/script.js']);
+    }
+    return await scriptModulePromise;
+}
+
+async function getWorldInfoModule() {
+    if (!worldInfoModulePromise) {
+        worldInfoModulePromise = importFirst(['../../../world-info.js', '/scripts/world-info.js']);
+    }
+    return await worldInfoModulePromise;
+}
+
+async function getFetchHeaders() {
+    try {
+        const script = await getScriptModule();
+        if (typeof script?.getRequestHeaders === 'function') {
+            return script.getRequestHeaders();
+        }
+    } catch (_) {}
+
+    if (!csrfTokenPromise) {
+        csrfTokenPromise = fetch('/csrf-token')
+            .then((r) => r.ok ? r.json() : null)
+            .then((data) => data?.token || '')
+            .catch(() => '');
+    }
+    const token = await csrfTokenPromise;
+    const headers = { 'Content-Type': 'application/json' };
+    if (token) headers['X-CSRF-Token'] = token;
+    return headers;
+}
+
+async function generateQuietPrompt(args) {
+    const ctx = context();
+    if (typeof ctx.generateQuietPrompt === 'function') {
+        return await ctx.generateQuietPrompt(args);
+    }
+    const script = await getScriptModule();
+    if (typeof script?.generateQuietPrompt === 'function') {
+        return await script.generateQuietPrompt(args);
+    }
+    throw new Error('当前 SillyTavern 没有暴露 generateQuietPrompt；请改用自填 OpenAI-compatible API。');
+}
+
+async function loadWorldInfo(name) {
+    const wi = await getWorldInfoModule();
+    if (typeof wi?.loadWorldInfo === 'function') {
+        return await wi.loadWorldInfo(name);
+    }
+    const response = await fetch('/api/worldinfo/get', {
+        method: 'POST',
+        headers: await getFetchHeaders(),
+        body: JSON.stringify({ name }),
+        cache: 'no-cache',
+    });
+    if (!response.ok) return null;
+    return await response.json();
+}
+
+async function saveWorldInfo(name, data, immediately = true) {
+    const wi = await getWorldInfoModule();
+    if (typeof wi?.saveWorldInfo === 'function') {
+        return await wi.saveWorldInfo(name, data, immediately);
+    }
+    await fetch('/api/worldinfo/edit', {
+        method: 'POST',
+        headers: await getFetchHeaders(),
+        body: JSON.stringify({ name, data }),
+    });
+}
+
+async function createNewWorldInfo(worldName, { interactive = false } = {}) {
+    const wi = await getWorldInfoModule();
+    if (typeof wi?.createNewWorldInfo === 'function') {
+        return await wi.createNewWorldInfo(worldName, { interactive });
+    }
+    await saveWorldInfo(worldName, { entries: {} }, true);
+    return true;
+}
+
+async function updateWorldInfoList() {
+    const wi = await getWorldInfoModule();
+    if (typeof wi?.updateWorldInfoList === 'function') {
+        return await wi.updateWorldInfoList();
+    }
+    try {
+        const response = await fetch('/api/settings/get', {
+            method: 'POST',
+            headers: await getFetchHeaders(),
+            body: JSON.stringify({}),
+        });
+        if (!response.ok) return;
+        const data = await response.json();
+        const names = Array.isArray(data.world_names) ? data.world_names : [];
+        const worldSelect = document.querySelector('#world_info');
+        const editorSelect = document.querySelector('#world_editor_select');
+        for (const select of [worldSelect, editorSelect]) {
+            if (!select) continue;
+            [...select.querySelectorAll('option')].forEach((opt) => { if (opt.value !== '') opt.remove(); });
+            names.forEach((name, i) => select.append(new Option(name, String(i))));
+        }
+    } catch (error) {
+        console.warn('[Role Memory Forge] updateWorldInfoList fallback failed', error);
+    }
+}
+
+function createWorldInfoEntry(_name, data) {
+    data.entries ||= {};
+    const used = new Set(Object.keys(data.entries).map((x) => Number(x)));
+    let uid = 0;
+    while (used.has(uid)) uid += 1;
+    const entry = {
+        uid,
+        key: [],
+        keysecondary: [],
+        comment: '',
+        content: '',
+        constant: true,
+        selective: false,
+        order: 100,
+        position: 4,
+        disable: false,
+        addMemo: true,
+    };
+    data.entries[uid] = entry;
+    return entry;
+}
 
 const MODULE_NAME = 'role_memory_forge';
 const MODULE_TITLE = 'Role Memory Forge';
@@ -350,7 +489,7 @@ async function writeWorldBook() {
     await updateWorldInfoList();
 }
 
-async function clearWorldBookEntries({ silent = false } = {}, onlyGeneratedEntries = true) {
+async function clearWorldBookEntries({ silent = false, onlyGeneratedEntries = true } = {}) {
     try {
         const state = getState();
         const worldName = state.worldName || getWorldName();
@@ -443,8 +582,7 @@ function buildRelationBook(state) {
         '```mermaid',
         buildMermaid(state.tracker.relationships),
         '```',
-    ].join('
-');
+    ].join('\n');
 }
 
 function buildIndexDatabaseBook(state) {
@@ -454,9 +592,7 @@ function buildIndexDatabaseBook(state) {
         '说明：每个表都以二维数组保存；第一行为字段名，后续为数据行。',
         '',
         ...buildAllIndexTables(state).map((table) => toIndexTableText(table)),
-    ].join('
-
-');
+    ].join('\n\n');
 }
 
 function buildStateTablesBook(state) {
@@ -473,8 +609,7 @@ function buildStateTablesBook(state) {
         toIndexTableText(buildPromiseIndexTable(state)),
         '',
         toIndexTableText(buildPlotIndexTable(state)),
-    ].join('
-');
+    ].join('\n');
 }
 
 function objectToBulletList(obj) {
@@ -1103,8 +1238,114 @@ async function rescanCurrentChat() {
     toast('当前聊天补录完成。', 'success');
 }
 
+
+function openRmfPanel() {
+    renderSettingsPanel();
+    const modal = document.querySelector('#rmf_modal');
+    modal?.classList.remove('rmf-hidden');
+    modal?.setAttribute('aria-hidden', 'false');
+    refreshPanelValues();
+    refreshDashboard();
+}
+
+function closeRmfPanel() {
+    const modal = document.querySelector('#rmf_modal');
+    modal?.classList.add('rmf-hidden');
+    modal?.setAttribute('aria-hidden', 'true');
+}
+
+function renderInlineEntry() {
+    if (document.querySelector('#rmf_extension_drawer')) return;
+    const host = document.querySelector('#extensions_settings2')
+        || document.querySelector('#extensions_settings')
+        || document.querySelector('.extensions_settings')
+        || document.querySelector('#extensions_panel');
+    if (!host) return;
+
+    const html = `
+    <div id="rmf_extension_drawer" class="rmf-extension-drawer inline-drawer">
+        <div class="inline-drawer-toggle inline-drawer-header rmf-extension-header">
+            <div class="rmf-extension-header-title">
+                <span class="rmf-mini-orb">🧠</span>
+                <b>Role Memory Forge</b>
+                <small>记忆插件</small>
+            </div>
+            <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
+        </div>
+        <div class="inline-drawer-content rmf-extension-content">
+            <div class="rmf-extension-row">
+                <label class="checkbox_label"><input id="rmf_inline_enabled" type="checkbox"> 启用记忆</label>
+                <label class="checkbox_label"><input id="rmf_inline_append" type="checkbox"> 回复结尾折叠简记</label>
+            </div>
+            <div class="rmf-extension-buttons">
+                <button id="rmf_inline_open" class="menu_button">打开记忆面板</button>
+                <button id="rmf_inline_process" class="menu_button">手动记录最新一轮</button>
+                <button id="rmf_inline_sync" class="menu_button">同步世界书</button>
+            </div>
+            <div id="rmf_inline_status" class="rmf-inline-status">悬浮球消失时，也可以从这里打开。</div>
+        </div>
+    </div>`;
+    host.insertAdjacentHTML('beforeend', html);
+
+    document.querySelector('#rmf_inline_open')?.addEventListener('click', openRmfPanel);
+    document.querySelector('#rmf_inline_process')?.addEventListener('click', () => processLatestExchange({ force: true }));
+    document.querySelector('#rmf_inline_sync')?.addEventListener('click', async () => {
+        await writeWorldBook();
+        toast('已同步到世界书。', 'success');
+    });
+    document.querySelector('#rmf_inline_enabled')?.addEventListener('change', async (event) => {
+        const s = settings();
+        s.enabled = Boolean(event.target.checked);
+        saveSettings();
+        if (s.enabled) {
+            await restoreStateFromWorldBookIfNeeded();
+            refreshPromptInjection();
+            await writeWorldBook().catch((error) => warn('inline writeWorldBook failed', error));
+        } else {
+            refreshPromptInjection();
+        }
+        refreshPanelValues();
+        refreshDashboard();
+    });
+    document.querySelector('#rmf_inline_append')?.addEventListener('change', (event) => {
+        settings().appendBriefToMessage = Boolean(event.target.checked);
+        saveSettings();
+        refreshPanelValues();
+    });
+    refreshInlineValues();
+}
+
+function refreshInlineValues() {
+    const s = settings();
+    const enabled = document.querySelector('#rmf_inline_enabled');
+    const append = document.querySelector('#rmf_inline_append');
+    const status = document.querySelector('#rmf_inline_status');
+    if (enabled) enabled.checked = !!s.enabled;
+    if (append) append.checked = !!s.appendBriefToMessage;
+    if (status) {
+        const state = getStateSafe();
+        status.textContent = `状态：${s.enabled ? '已启用' : '未启用'}｜简记 ${state?.records?.length || 0} 条｜世界书 ${state?.worldName || getWorldNameSafe()}`;
+    }
+}
+
+function getStateSafe() {
+    try { return getState(); } catch (_) { return null; }
+}
+
+function getWorldNameSafe() {
+    try { return getWorldName(); } catch (_) { return 'RMF-记忆世界书'; }
+}
+
 function renderSettingsPanel() {
-    if (document.querySelector('#rmf_settings')) return;
+    renderInlineEntry();
+    // 旧版因为只判断 #rmf_settings，导致扩展面板没有入口；这里保证悬浮球、弹窗、扩展入口都能被补建。
+    if (document.querySelector('#rmf_settings') && document.querySelector('#rmf_float_button')) {
+        refreshPanelValues();
+        refreshDashboard();
+        return;
+    }
+    document.querySelector('#rmf_float_button')?.remove();
+    document.querySelector('#rmf_modal')?.remove();
     const html = `
     <button id="rmf_float_button" class="rmf-float" title="Role Memory Forge">
         <span>🧠</span>
@@ -1229,22 +1470,15 @@ function renderSettingsPanel() {
 }
 
 function bindFloatingPanelEvents() {
-    const modal = document.querySelector('#rmf_modal');
-    const open = () => {
-        modal?.classList.remove('rmf-hidden');
-        modal?.setAttribute('aria-hidden', 'false');
-        refreshDashboard();
-    };
-    const close = () => {
-        modal?.classList.add('rmf-hidden');
-        modal?.setAttribute('aria-hidden', 'true');
-    };
-    document.querySelector('#rmf_float_button')?.addEventListener('click', open);
-    document.querySelector('#rmf_backdrop')?.addEventListener('click', close);
-    document.querySelector('#rmf_close')?.addEventListener('click', close);
-    document.addEventListener('keydown', (event) => {
-        if (event.key === 'Escape') close();
-    });
+    document.querySelector('#rmf_float_button')?.addEventListener('click', openRmfPanel);
+    document.querySelector('#rmf_backdrop')?.addEventListener('click', closeRmfPanel);
+    document.querySelector('#rmf_close')?.addEventListener('click', closeRmfPanel);
+    if (!globalThis.__rmfEscBound) {
+        globalThis.__rmfEscBound = true;
+        document.addEventListener('keydown', (event) => {
+            if (event.key === 'Escape') closeRmfPanel();
+        });
+    }
 }
 
 function bindPanelEvents() {
@@ -1337,6 +1571,7 @@ function refreshPanelValues() {
     set('rmf_briefFoldTitle', s.briefFoldTitle);
     set('rmf_relationGraphMaxNodes', s.relationGraphMaxNodes);
     set('rmf_worldNameTemplate', s.worldNameTemplate);
+    refreshInlineValues();
 }
 
 function avatarUrlForName(name) {
@@ -1481,6 +1716,7 @@ function refreshDashboard() {
     const state = getState();
     const pending = state.summaries.filter((s) => !s.consolidated).length;
     if (badge) badge.textContent = String(state.records.length || 0);
+    refreshInlineValues();
     if (floatButton) {
         floatButton.classList.toggle('is-disabled', !settings().enabled);
         floatButton.title = settings().enabled ? 'Role Memory Forge 已启用' : 'Role Memory Forge 未启用';
@@ -1534,52 +1770,132 @@ function exportJson() {
     URL.revokeObjectURL(a.href);
 }
 
+let eventsRegistered = false;
+let fallbackWatchStarted = false;
+let lastChatIdentity = '';
+
+function onEventSafe(events, source, name, handler) {
+    const eventName = events?.[name];
+    if (!source || !eventName || typeof source.on !== 'function') {
+        warn(`事件 ${name} 不存在，已交给兜底轮询处理。`);
+        return;
+    }
+    source.on(eventName, async (...args) => {
+        try {
+            await handler(...args);
+        } catch (error) {
+            warn(`event handler ${name} failed`, error);
+        }
+    });
+}
+
 function registerEvents() {
+    if (eventsRegistered) return;
     const ctx = context();
     const events = ctx.eventTypes || ctx.event_types;
-    ctx.eventSource.on(events.APP_READY, async () => {
+    const source = ctx.eventSource;
+    if (!events || !source) {
+        warn('SillyTavern eventSource 尚未就绪，使用兜底轮询。');
+        return;
+    }
+    eventsRegistered = true;
+
+    onEventSafe(events, source, 'APP_READY', async () => {
         renderSettingsPanel();
         await restoreStateFromWorldBookIfNeeded();
         refreshPromptInjection();
     });
-    ctx.eventSource.on(events.CHAT_CHANGED, async () => {
+    onEventSafe(events, source, 'APP_INITIALIZED', async () => {
+        renderSettingsPanel();
+        refreshPromptInjection();
+    });
+    onEventSafe(events, source, 'CHAT_CHANGED', async () => {
         await restoreStateFromWorldBookIfNeeded();
         refreshPromptInjection();
         refreshPanelValues();
         refreshDashboard();
     });
-    ctx.eventSource.on(events.CHAT_CREATED, async () => {
+    onEventSafe(events, source, 'CHAT_CREATED', async () => {
         if (!settings().keepAcrossNewChats) {
             await clearCurrentMemory({ clearWorld: true, silent: true });
         } else {
             await restoreStateFromWorldBookIfNeeded();
         }
     });
-    ctx.eventSource.on(events.MESSAGE_RECEIVED, scheduleProcessLatest);
-    ctx.eventSource.on(events.MESSAGE_SWIPED, scheduleProcessLatest);
-    ctx.eventSource.on(events.MESSAGE_EDITED, async () => {
+    onEventSafe(events, source, 'MESSAGE_RECEIVED', scheduleProcessLatest);
+    onEventSafe(events, source, 'MESSAGE_SWIPED', scheduleProcessLatest);
+    onEventSafe(events, source, 'MESSAGE_EDITED', async () => {
         const state = getState();
         state.lastError = '消息被编辑过：建议点击“补录当前聊天”重建记忆，避免旧简记不一致。';
         await saveState();
     });
-    ctx.eventSource.on(events.MESSAGE_DELETED, async () => {
+    onEventSafe(events, source, 'MESSAGE_DELETED', async () => {
         const state = getState();
         state.lastError = '消息被删除过：建议点击“补录当前聊天”重建记忆，避免旧简记不一致。';
         await saveState();
     });
 }
 
+function startFallbackWatch() {
+    if (fallbackWatchStarted) return;
+    fallbackWatchStarted = true;
+    setInterval(async () => {
+        try {
+            if (!globalThis.SillyTavern?.getContext) return;
+            renderInlineEntry();
+            if (!document.querySelector('#rmf_float_button') || !document.querySelector('#rmf_settings')) {
+                renderSettingsPanel();
+            }
+            const ctx = context();
+            const identity = `${ctx.characterId ?? ''}|${ctx.groupId ?? ''}|${ctx.chatId ?? ''}|${ctx.chat?.length ?? 0}`;
+            if (identity !== lastChatIdentity) {
+                lastChatIdentity = identity;
+                refreshPanelValues();
+                refreshDashboard();
+                refreshPromptInjection();
+            }
+            if (settings().enabled && settings().autoProcess) {
+                scheduleProcessLatest();
+            }
+        } catch (error) {
+            warn('fallback watch failed', error);
+        }
+    }, 4500);
+}
+
 let initialized = false;
+let initRunning = false;
 
 async function init() {
-    if (initialized) return;
-    initialized = true;
-    settings();
-    registerEvents();
-    renderSettingsPanel();
-    await restoreStateFromWorldBookIfNeeded();
-    refreshPromptInjection();
-    log('loaded');
+    if (initRunning) return;
+    initRunning = true;
+    try {
+        if (!globalThis.SillyTavern?.getContext) {
+            setTimeout(() => init().catch((error) => warn('delayed init failed', error)), 600);
+            return;
+        }
+        settings();
+        renderSettingsPanel();
+        registerEvents();
+        startFallbackWatch();
+        initialized = true;
+        setTimeout(async () => {
+            try {
+                await restoreStateFromWorldBookIfNeeded();
+                refreshPromptInjection();
+                refreshPanelValues();
+                refreshDashboard();
+            } catch (error) {
+                warn('post init restore failed', error);
+            }
+        }, 100);
+        log('loaded');
+    } catch (error) {
+        warn('init failed', error);
+        setTimeout(() => init().catch((e) => warn('retry init failed', e)), 1000);
+    } finally {
+        initRunning = false;
+    }
 }
 
 export async function onActivate() {

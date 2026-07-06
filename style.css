@@ -678,3 +678,99 @@
     opacity: .62;
     font-size: 11px;
 }
+
+/* v0.3.1 visibility hotfix: 强制悬浮球在 PC / 手机都显示在最上层 */
+#rmf_float_button.rmf-float {
+    display: grid !important;
+    visibility: visible !important;
+    opacity: 1 !important;
+    pointer-events: auto !important;
+    z-index: 2147483000 !important;
+    right: max(18px, env(safe-area-inset-right)) !important;
+    bottom: calc(96px + env(safe-area-inset-bottom)) !important;
+}
+
+#rmf_modal.rmf-modal {
+    z-index: 2147483001 !important;
+}
+
+.rmf-extension-drawer {
+    margin: 10px 0;
+    border: 1px solid rgba(120, 210, 255, .18);
+    border-radius: 14px;
+    overflow: hidden;
+    background: linear-gradient(135deg, rgba(72, 214, 255, .08), rgba(159, 107, 255, .06));
+}
+
+.rmf-extension-header {
+    min-height: 42px;
+}
+
+.rmf-extension-header-title {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.rmf-extension-header-title small {
+    opacity: .66;
+    font-size: 12px;
+    margin-left: 2px;
+}
+
+.rmf-mini-orb {
+    width: 24px;
+    height: 24px;
+    display: inline-grid;
+    place-items: center;
+    border-radius: 9px;
+    background: linear-gradient(145deg, rgba(72, 214, 255, .85), rgba(159, 107, 255, .88));
+    box-shadow: 0 0 18px rgba(72, 214, 255, .22);
+}
+
+.rmf-extension-content {
+    padding: 10px 12px 12px;
+}
+
+.rmf-extension-row {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(120px, 1fr));
+    gap: 8px;
+    margin-bottom: 10px;
+}
+
+.rmf-extension-buttons {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-bottom: 8px;
+}
+
+.rmf-inline-status {
+    opacity: .72;
+    font-size: 12px;
+    line-height: 1.45;
+}
+
+@media (max-width: 768px) {
+    #rmf_float_button.rmf-float {
+        width: 52px;
+        height: 52px;
+        border-radius: 19px;
+        right: max(12px, env(safe-area-inset-right)) !important;
+        bottom: calc(86px + env(safe-area-inset-bottom)) !important;
+    }
+    #rmf_settings.rmf-window {
+        inset: 10px !important;
+        width: auto !important;
+        max-height: calc(100vh - 20px) !important;
+        transform: none !important;
+        border-radius: 20px !important;
+    }
+    .rmf-quick-row,
+    .rmf-layout,
+    .rmf-grid,
+    .rmf-extension-row {
+        grid-template-columns: 1fr !important;
+    }
+}
