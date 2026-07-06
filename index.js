@@ -1,4 +1,4 @@
-// Role Memory Forge v0.4.1
+// Role Memory Forge v0.4.2
 // 这一版不再使用会直接炸掉插件的静态 import。
 // SillyTavern 内部模块路径有时会随版本变化，静态 import 一旦失败，悬浮球和入口都会消失。
 // 这里改为：先渲染 UI，再动态按需加载 ST API / WorldInfo API。
@@ -164,6 +164,7 @@ const WORLD_ENTRY_COMMENT = `${ENTRY_MARK} 04 状态档案设定表`;
 const WALKTHROUGH_MARK = '<!--RMF_WALKTHROUGH_START-->';
 const WALKTHROUGH_END = '<!--RMF_WALKTHROUGH_END-->';
 const WALKTHROUGH_ENTRY_COMMENT = `${ENTRY_MARK} 05 走马灯回顾`;
+const ACU_INDEX_ENTRY_COMMENT = 'TavernDB-ACU-RMF-IndexData';
 
 const DEFAULT_SETTINGS = Object.freeze({
     enabled: false,
@@ -189,6 +190,8 @@ const DEFAULT_SETTINGS = Object.freeze({
     autoProcess: true,
     includeRawJsonEntry: true,
     appendBriefToMessage: true,
+    autoHideSummarizedBriefs: true,
+    shujukuAcuCompatibleIndex: true,
     briefFoldTitle: '🧠 本轮记忆简记',
     showFloatingPanel: true,
     relationGraphMaxNodes: 10,
@@ -485,7 +488,7 @@ function stateHasContent(state = getState()) {
 
 function findGeneratedEntries(data) {
     const entries = data?.entries || {};
-    return Object.values(entries).filter((entry) => String(entry.comment || '').startsWith(ENTRY_MARK));
+    return Object.values(entries).filter((entry) => String(entry.comment || '').startsWith(ENTRY_MARK) || String(entry.comment || '') === ACU_INDEX_ENTRY_COMMENT);
 }
 
 async function ensureWorldBook() {
@@ -603,6 +606,10 @@ async function writeWorldBook() {
         upsertEntry(data, RAW_ENTRY_COMMENT, `\`\`\`json\n${JSON.stringify(state, null, 2)}\n\`\`\``, 999);
     }
 
+    if (settings().shujukuAcuCompatibleIndex) {
+        upsertAcuIndexEntry(data, JSON.stringify(buildAcuCompatibleDatabase(state), null, 2));
+    }
+
     await saveWorldInfo(worldName, data, true);
     await updateWorldInfoList();
 }
@@ -614,7 +621,7 @@ async function clearWorldBookEntries({ silent = false, onlyGeneratedEntries = tr
         const data = await loadWorldInfo(worldName);
         if (!data?.entries) return;
         for (const [uid, entry] of Object.entries(data.entries)) {
-            if (!onlyGeneratedEntries || String(entry.comment || '').startsWith(ENTRY_MARK)) {
+            if (!onlyGeneratedEntries || String(entry.comment || '').startsWith(ENTRY_MARK) || String(entry.comment || '') === ACU_INDEX_ENTRY_COMMENT) {
                 delete data.entries[uid];
             }
         }
@@ -677,9 +684,23 @@ function buildWorldBookDashboard(state) {
     ].join('\n');
 }
 
+function getCoveredRecordIdForHiding(state = getState()) {
+    const summaryCovered = (Array.isArray(state.summaries) ? state.summaries : []).reduce((max, item) => Math.max(max, Number(item.endRecordId || 0)), 0);
+    return Math.max(summaryCovered, Number(state.megaSummary?.coversRecordId || 0));
+}
+
+function visibleRecordsForDisplay(state = getState()) {
+    const records = Array.isArray(state.records) ? state.records : [];
+    if (!settings().autoHideSummarizedBriefs) return records;
+    const covered = getCoveredRecordIdForHiding(state);
+    return records.filter((record) => Number(record.id || 0) > covered);
+}
+
 function buildRecordsBook(state) {
-    const rows = state.records.map((record) => `- #${record.id} ${record.brief}`).join('\n');
-    return ['# 每层简略记录', rows || '暂无。'].join('\n\n');
+    const visible = visibleRecordsForDisplay(state);
+    const hiddenCount = Math.max(0, (state.records?.length || 0) - visible.length);
+    const rows = visible.map((record) => `- #${record.id} ${record.brief}`).join('\n');
+    return ['# 每层简略记录', hiddenCount ? `已自动隐藏 ${hiddenCount} 条已进入阶段总结/大总结的简记。` : '暂无隐藏简记。', '', rows || '暂无未总结简记。'].join('\n');
 }
 
 function buildRelationBook(state) {
@@ -835,7 +856,7 @@ function buildPlotIndexTable(state = getState()) {
 }
 
 function buildRecordIndexTable(state = getState()) {
-    const rows = (Array.isArray(state?.records) ? state.records : []).slice(-80).map((r) => [
+    const rows = visibleRecordsForDisplay(state).slice(-80).map((r) => [
         r.id,
         r.userName || '{{user}}',
         r.aiName || getCharacterName(),
@@ -891,6 +912,62 @@ function buildAllIndexTables(state = getState()) {
     ];
 }
 
+function toAcuSheet(table, index) {
+    return {
+        name: table.name,
+        content: [
+            [null, ...table.columns],
+            ...table.rows.map((row) => [null, ...table.columns.map((_, i) => safeCell(row[i] ?? '', 1200))]),
+        ],
+        sourceData: {
+            note: 'Role Memory Forge 自动生成的数据库表；兼容 shujuku/TavernDB-ACU 的 content 二维表结构。',
+            initNode: `初始化 ${table.name}`,
+            insertNode: `新增 ${table.name}`,
+            updateNode: `更新 ${table.name}`,
+            deleteNode: `删除 ${table.name}`,
+        },
+        rmfIndex: index,
+        updatedAt: table.updatedAt || nowIso(),
+    };
+}
+
+function buildAcuCompatibleDatabase(state = getState()) {
+    const result = {};
+    buildAllIndexTables(state).forEach((table, index) => {
+        result[String(index)] = toAcuSheet(table, index);
+    });
+    return result;
+}
+
+function configureAcuIndexEntry(entry, content) {
+    entry.comment = ACU_INDEX_ENTRY_COMMENT;
+    entry.content = content || '{}';
+    entry.key = ['__RMF_ACU_INDEX_DATA_DO_NOT_TRIGGER__'];
+    entry.keysecondary = [];
+    entry.disable = false;
+    entry.enabled = true;
+    entry.constant = false;
+    entry.selective = true;
+    entry.order = 10000;
+    entry.position = 4;
+    entry.depth = settings().injectDepth;
+    entry.role = extension_prompt_roles.SYSTEM;
+    entry.addMemo = true;
+    entry.excludeRecursion = true;
+    entry.preventRecursion = true;
+    entry.matchWholeWords = false;
+    entry.caseSensitive = false;
+    entry.displayIndex = entry.displayIndex ?? 10000;
+    return entry;
+}
+
+function upsertAcuIndexEntry(data, content) {
+    let entry = Object.values(data.entries || {}).find((x) => x.comment === ACU_INDEX_ENTRY_COMMENT);
+    if (!entry) entry = createWorldInfoEntry('', data);
+    return configureAcuIndexEntry(entry, content);
+}
+
+
 function compactIndexTableForPrompt(table, maxRows = 24) {
     const compact = { ...table, rows: table.rows.slice(0, maxRows) };
     return toIndexTableText(compact);
@@ -930,7 +1007,7 @@ function buildInjectionText(state = getState()) {
         .filter((item) => !item.consolidated)
         .map((item) => `- ${item.content}`)
         .join('\n');
-    const recentRecords = state.records
+    const recentRecords = visibleRecordsForDisplay(state)
         .slice(-s.recentRecordCount)
         .map((record) => `- #${record.id} ${record.brief}`)
         .join('\n');
@@ -1094,18 +1171,109 @@ function makePairKey(userIndex, aiIndex, userText, aiText) {
     return `${userIndex}:${aiIndex}:${String(userText || '').slice(0, 80)}:${String(aiText || '').slice(0, 80)}`;
 }
 
-function getMessageRawContent(message) {
-    if (!message) return '';
-    let text = message.mes;
-    if ((!text || !String(text).trim()) && Array.isArray(message.swipes) && message.swipes.length) {
-        const swipeId = Number.isFinite(Number(message.swipe_id)) ? Number(message.swipe_id) : 0;
-        text = message.swipes[swipeId] || message.swipes[0] || '';
+function pickFirstTextValue(...values) {
+    for (const value of values) {
+        if (value === null || value === undefined) continue;
+        if (Array.isArray(value)) {
+            const nested = pickFirstTextValue(...value);
+            if (nested) return nested;
+            continue;
+        }
+        if (typeof value === 'object') continue;
+        const text = String(value).trim();
+        if (text) return text;
     }
-    return String(text ?? '');
+    return '';
 }
 
-function getMessageText(message) {
-    return stripHtml(getMessageRawContent(message));
+function collectNamedTextFields(obj, depth = 0, out = []) {
+    if (!obj || typeof obj !== 'object' || depth > 3) return out;
+    const wanted = /^(mes|message|content|text|body|value|display_text|displayText|raw|reply|response)$/i;
+    for (const [key, value] of Object.entries(obj)) {
+        if (value === null || value === undefined) continue;
+        if (typeof value === 'string' && wanted.test(key) && value.trim()) {
+            out.push(value);
+        } else if (Array.isArray(value)) {
+            for (const item of value.slice(0, 4)) {
+                if (typeof item === 'string' && wanted.test(key) && item.trim()) out.push(item);
+                else if (item && typeof item === 'object') collectNamedTextFields(item, depth + 1, out);
+            }
+        } else if (typeof value === 'object' && !['extra', 'data', 'metadata', 'api_message', 'message', 'content', 'display'].includes(String(key)) && depth >= 2) {
+            continue;
+        } else if (typeof value === 'object') {
+            collectNamedTextFields(value, depth + 1, out);
+        }
+    }
+    return out;
+}
+
+function getDomMessageElement(index) {
+    if (!Number.isFinite(Number(index))) return null;
+    const escaped = globalThis.CSS?.escape ? CSS.escape(String(index)) : String(index).replace(/[\\"]/g, '\\$&');
+    return document.querySelector(`.mes[mesid="${escaped}"], .mes[mesid='${escaped}'], [data-mes-id="${escaped}"], [data-message-id="${escaped}"]`);
+}
+
+function extractTextFromDomMessage(index) {
+    const el = getDomMessageElement(index);
+    if (!el) return '';
+    const clone = el.cloneNode(true);
+    clone.querySelectorAll('script, style, .mes_buttons, .extraMesButtons, .mes_edit_buttons, .mes_timer, .timestamp, .rmf-brief-fold, [data-rmf-brief], .mesIDDisplay, .tokenCounterDisplay').forEach((x) => x.remove());
+    const textEl = clone.querySelector('.mes_text, .mes_block .mes_text, .message_text, .swipe_text') || clone;
+    return stripHtml(textEl.innerHTML || textEl.textContent || '');
+}
+
+function getDomMessageRole(index) {
+    const el = getDomMessageElement(index);
+    if (!el) return '';
+    const raw = `${el.className || ''} ${el.getAttribute('is_user') || ''} ${el.dataset?.isUser || ''} ${el.getAttribute('data-is-user') || ''}`.toLowerCase();
+    if (/user_mes|is_user[^a-z0-9]*true|true/.test(raw) && !/assistant|bot/.test(raw)) return 'user';
+    if (/char_mes|assistant|bot|ai_mes|is_user[^a-z0-9]*false|false/.test(raw)) return 'assistant';
+    const name = normalizeNameForScan(el.querySelector('.name_text, .ch_name, .mes_name')?.textContent || '');
+    if (name && getKnownUserNamesForScan().has(name)) return 'user';
+    if (name && getKnownAssistantNamesForScan().has(name)) return 'assistant';
+    return '';
+}
+
+function getMessageRawContent(message, index = -1) {
+    if (!message) return '';
+    const swipeId = Number.isFinite(Number(message.swipe_id)) ? Number(message.swipe_id) : 0;
+    const direct = pickFirstTextValue(
+        message.mes,
+        message.message,
+        message.content,
+        message.text,
+        message.body,
+        message.value,
+        message.display_text,
+        message.displayText,
+        message.extra?.display_text,
+        message.extra?.displayText,
+        message.extra?.mes,
+        message.extra?.message,
+        message.extra?.content,
+        message.extra?.text,
+        message.data?.mes,
+        message.data?.message,
+        message.data?.content,
+        message.data?.text,
+        message.api_message?.content,
+        message.extra?.api_message?.content,
+        Array.isArray(message.swipes) ? (message.swipes[swipeId] || message.swipes[0]) : ''
+    );
+    if (direct) return direct;
+
+    const named = collectNamedTextFields(message)
+        .map((x) => String(x || '').trim())
+        .filter(Boolean)
+        .sort((a, b) => b.length - a.length)[0];
+    if (named) return named;
+
+    const idx = Number.isFinite(Number(index)) && Number(index) >= 0 ? Number(index) : (context().chat || []).indexOf(message);
+    return extractTextFromDomMessage(idx);
+}
+
+function getMessageText(message, index = -1) {
+    return stripHtml(getMessageRawContent(message, index));
 }
 
 function normalizeNameForScan(name = '') {
@@ -1158,28 +1326,31 @@ function getKnownAssistantNamesForScan() {
     return names;
 }
 
-function getMessageRole(message) {
+function getMessageRole(message, index = -1) {
     if (!message) return 'empty';
     if (message.is_system || message.system || message.extra?.type === 'system') return 'system';
     if (isRmfUtilityMessage(message)) return 'system';
 
-    const text = getMessageText(message);
-    if (!text) return 'empty';
-
-    const roleFields = [message.role, message.sender, message.type, message.extra?.role, message.extra?.sender]
+    const roleFields = [message.role, message.sender, message.type, message.extra?.role, message.extra?.sender, message.data?.role]
         .filter(Boolean).map((x) => String(x).toLowerCase());
     if (roleFields.some((x) => ['system', 'instruction'].includes(x))) return 'system';
     if (roleFields.some((x) => ['user', 'human', 'player'].includes(x))) return 'user';
     if (roleFields.some((x) => ['assistant', 'character', 'bot', 'ai', 'model'].includes(x))) return 'assistant';
 
-    if (message.is_user === true || message.is_user === 'true') return 'user';
-    if (message.is_user === false || message.is_user === 'false') return 'assistant';
+    if (message.is_user === true || message.is_user === 'true' || message.isUser === true) return 'user';
+    if (message.is_user === false || message.is_user === 'false' || message.isUser === false) return 'assistant';
 
-    const name = normalizeNameForScan(message.name || message.user || message.from || message.sender_name || message.extra?.name || '');
+    const domRole = getDomMessageRole(index);
+    if (domRole) return domRole;
+
+    const name = normalizeNameForScan(message.name || message.user || message.from || message.sender_name || message.extra?.name || message.data?.name || '');
     const userNames = getKnownUserNamesForScan();
     const assistantNames = getKnownAssistantNamesForScan();
     if (name && userNames.has(name)) return 'user';
     if (name && assistantNames.has(name)) return 'assistant';
+
+    const text = getMessageText(message, index);
+    if (!text) return 'empty';
 
     // 有些导入的 json/jsonl 没有 is_user，只保留 name。只要名字不是当前 user，就按角色/AI 处理。
     if (name && !userNames.has(name)) return 'assistant';
@@ -1187,8 +1358,8 @@ function getMessageRole(message) {
 }
 
 function exchangeFromIndexes(chat, userIndex, aiIndex) {
-    const userText = getMessageText(chat[userIndex]);
-    const aiText = getMessageText(chat[aiIndex]);
+    const userText = getMessageText(chat[userIndex], userIndex);
+    const aiText = getMessageText(chat[aiIndex], aiIndex);
     if (!userText || !aiText) return null;
     return {
         pairKey: makePairKey(userIndex, aiIndex, userText, aiText),
@@ -1233,7 +1404,7 @@ function buildNearestUserPairs(chat, roles) {
     for (let aiIndex = 0; aiIndex < chat.length; aiIndex++) {
         const role = roles[aiIndex];
         if (role !== 'assistant' && role !== 'unknown') continue;
-        if (!getMessageText(chat[aiIndex])) continue;
+        if (!getMessageText(chat[aiIndex], aiIndex)) continue;
         let userIndex = -1;
         for (let j = aiIndex - 1; j >= 0; j--) {
             if (roles[j] === 'system' || roles[j] === 'empty') continue;
@@ -1254,7 +1425,7 @@ function buildAlternatingFallbackPairs(chat, roles) {
     const candidates = [];
     for (let i = 0; i < chat.length; i++) {
         if (roles[i] === 'system' || roles[i] === 'empty') continue;
-        const text = getMessageText(chat[i]);
+        const text = getMessageText(chat[i], i);
         if (!text) continue;
         candidates.push(i);
     }
@@ -1269,18 +1440,42 @@ function buildAlternatingFallbackPairs(chat, roles) {
     return pairs;
 }
 
+function buildLooseDomFallbackPairs(chat) {
+    // 极限兜底：部分导入记录在 ctx.chat 里被标成 system/empty，但 DOM 里仍有完整聊天文本。
+    // 这时不再信任 role，只按实际可读文本的楼层顺序两两配对。
+    const candidates = [];
+    for (let i = 0; i < chat.length; i++) {
+        if (isRmfUtilityMessage(chat[i])) continue;
+        const text = getMessageText(chat[i], i);
+        if (!text) continue;
+        // 跳过明显的 RMF 自身回顾或系统提示，避免污染历史补录。
+        if (/Role Memory Forge|RMF_INDEX_TABLE|RMF_WALKTHROUGH_START|TavernDB-ACU-RMF/i.test(text)) continue;
+        candidates.push(i);
+    }
+    const pairs = [];
+    const seen = new Set();
+    const firstRole = getDomMessageRole(candidates[0]) || getMessageRole(chat[candidates[0]], candidates[0]);
+    const start = firstRole === 'assistant' ? 1 : 0;
+    for (let i = start; i < candidates.length - 1; i += 2) {
+        pushUniquePair(pairs, seen, exchangeFromIndexes(chat, candidates[i], candidates[i + 1]));
+    }
+    return pairs;
+}
+
 function getAllChatExchanges() {
     const chat = context().chat || [];
-    const roles = chat.map((message) => getMessageRole(message));
+    const roles = chat.map((message, index) => getMessageRole(message, index));
 
     const sequential = buildSequentialPairs(chat, roles);
     const nearest = buildNearestUserPairs(chat, roles);
     const alternating = buildAlternatingFallbackPairs(chat, roles);
+    const loose = buildLooseDomFallbackPairs(chat);
 
     let best = sequential;
     if (nearest.length > best.length) best = nearest;
     // 当正常识别明显过少时，用纯顺序兜底；避免你导入 200 多层却只识别到 3 轮。
-    if (best.length < 5 && alternating.length > best.length) best = alternating;
+    if ((best.length < 5 || alternating.length > best.length * 2) && alternating.length > best.length) best = alternating;
+    if ((best.length < 10 || loose.length > best.length * 2) && loose.length > best.length) best = loose;
 
     best.sort((a, b) => a.aiIndex - b.aiIndex || a.userIndex - b.userIndex);
     const uniq = [];
@@ -1291,7 +1486,14 @@ function getAllChatExchanges() {
 
 function getChatScanStats() {
     const chat = context().chat || [];
-    const roles = chat.map((message) => getMessageRole(message));
+    const roles = chat.map((message, index) => getMessageRole(message, index));
+    let domText = 0;
+    let objectText = 0;
+    chat.forEach((message, index) => {
+        const direct = pickFirstTextValue(message?.mes, message?.message, message?.content, message?.text, message?.body, message?.value, Array.isArray(message?.swipes) ? message.swipes[0] : '');
+        if (direct) objectText += 1;
+        if (!direct && extractTextFromDomMessage(index)) domText += 1;
+    });
     return {
         messages: chat.length,
         user: roles.filter((x) => x === 'user').length,
@@ -1299,17 +1501,20 @@ function getChatScanStats() {
         unknown: roles.filter((x) => x === 'unknown').length,
         system: roles.filter((x) => x === 'system').length,
         empty: roles.filter((x) => x === 'empty').length,
+        objectText,
+        domText,
+        textMessages: chat.filter((message, index) => !!getMessageText(message, index)).length,
         pairs: getAllChatExchanges().length,
     };
 }
 
 function getLatestExchange() {
     const chat = context().chat || [];
-    const roles = chat.map((message) => getMessageRole(message));
+    const roles = chat.map((message, index) => getMessageRole(message, index));
     let aiIndex = -1;
     for (let i = chat.length - 1; i >= 0; i--) {
         const role = roles[i];
-        if ((role === 'assistant' || role === 'unknown') && getMessageText(chat[i])) {
+        if ((role === 'assistant' || role === 'unknown') && getMessageText(chat[i], i)) {
             aiIndex = i;
             break;
         }
@@ -1317,7 +1522,7 @@ function getLatestExchange() {
     if (aiIndex <= 0) return null;
     let userIndex = -1;
     for (let i = aiIndex - 1; i >= 0; i--) {
-        if (roles[i] === 'user' && getMessageText(chat[i])) {
+        if (roles[i] === 'user' && getMessageText(chat[i], i)) {
             userIndex = i;
             break;
         }
@@ -1370,6 +1575,7 @@ async function processLatestExchange({ force = false } = {}) {
 
         await maybeCreateChunkSummary(state);
         await maybeCreateMegaSummary(state);
+        await hideSummarizedBriefFolds(state);
         await saveState();
         if (settings().autoSyncWorldBook) {
             await writeWorldBook();
@@ -1472,13 +1678,20 @@ async function maybeCreateChunkSummary(state) {
     if (newRecords.length < chunkSize) return;
     const chunk = newRecords.slice(0, chunkSize);
     updateStatus(`正在生成 ${chunk.length} 条简记的阶段总结……`);
-    const raw = await callMemoryModel(buildChunkSummaryPrompt(chunk), { json: true });
-    const json = parseJsonLoose(raw);
+    let content = '';
+    try {
+        const raw = await callMemoryModel(buildChunkSummaryPrompt(chunk), { json: true });
+        const json = parseJsonLoose(raw);
+        content = String(json.summary || raw || '').trim();
+    } catch (error) {
+        warn('chunk summary fallback used', error);
+        content = chunk.map((r) => `#${r.id} ${r.brief}`).join('；').slice(0, 3000);
+    }
     state.summaries.push({
         id: (state.summaries.at(-1)?.id || 0) + 1,
         startRecordId: chunk[0].id,
         endRecordId: chunk.at(-1).id,
-        content: String(json.summary || raw || '').trim(),
+        content,
         consolidated: false,
         createdAt: nowIso(),
     });
@@ -1491,10 +1704,17 @@ async function maybeCreateMegaSummary(state) {
     if (pending.length < megaEvery) return;
     const batch = pending.slice(0, megaEvery);
     updateStatus(`正在生成大总结（${batch.length} 个阶段总结）……`);
-    const raw = await callMemoryModel(buildMegaSummaryPrompt({ oldMega: state.megaSummary.content, summaries: batch }), { json: true });
-    const json = parseJsonLoose(raw);
+    let content = '';
+    try {
+        const raw = await callMemoryModel(buildMegaSummaryPrompt({ oldMega: state.megaSummary.content, summaries: batch }), { json: true });
+        const json = parseJsonLoose(raw);
+        content = String(json.megaSummary || raw || '').trim();
+    } catch (error) {
+        warn('mega summary fallback used', error);
+        content = [state.megaSummary.content || '', ...batch.map((x) => x.content)].filter(Boolean).join('\n').slice(0, 6000);
+    }
     state.megaSummary = {
-        content: String(json.megaSummary || raw || '').trim(),
+        content,
         coversRecordId: batch.at(-1).endRecordId,
         coversSummaryCount: (state.megaSummary.coversSummaryCount || 0) + batch.length,
         updatedAt: nowIso(),
@@ -1502,6 +1722,24 @@ async function maybeCreateMegaSummary(state) {
     for (const summary of batch) {
         summary.consolidated = true;
     }
+}
+
+async function hideSummarizedBriefFolds(state = getState()) {
+    if (!settings().autoHideSummarizedBriefs) return;
+    const covered = getCoveredRecordIdForHiding(state);
+    if (!covered) return;
+    const chat = context().chat || [];
+    let changed = false;
+    for (const record of state.records || []) {
+        if (Number(record.id || 0) > covered || record.foldHidden) continue;
+        const msg = chat[record.aiIndex];
+        if (msg?.mes && String(msg.mes).includes('RMF_BRIEF_START')) {
+            msg.mes = stripRmfFoldHtml(msg.mes);
+            changed = true;
+        }
+        record.foldHidden = true;
+    }
+    if (changed) await saveChatAfterMessagePatch();
 }
 
 function scheduleProcessLatest() {
@@ -1522,11 +1760,11 @@ async function rescanCurrentChat({ confirmFirst = true, clearFirst = true, label
     const scan = getChatScanStats();
     if (!pairs.length) {
         toast('没有找到可补录的 user/AI 对话轮。', 'warning');
-        updateStatus(`扫描结果：消息 ${scan.messages}，user ${scan.user}，AI ${scan.assistant}，未知 ${scan.unknown}，成对 0`);
+        updateStatus(`扫描结果：消息 ${scan.messages}，user ${scan.user}，AI ${scan.assistant}，未知 ${scan.unknown}，DOM补文 ${scan.domText}，成对 0`);
         return;
     }
     if (confirmFirst) {
-        const ok = confirm(`即将从 0 层开始一键记忆 ${pairs.length} 轮${label}。\n\n扫描到：总消息 ${scan.messages} 条；user ${scan.user} 条；AI ${scan.assistant} 条；未知 ${scan.unknown} 条；系统/空消息 ${scan.system + scan.empty} 条。\n\n这会调用总结模型逐轮补录，聊天越长耗时越久。是否开始？`);
+        const ok = confirm(`即将从 0 层开始一键记忆 ${pairs.length} 轮${label}。\n\n扫描到：总消息 ${scan.messages} 条；user ${scan.user} 条；AI ${scan.assistant} 条；未知 ${scan.unknown} 条；系统/空消息 ${scan.system + scan.empty} 条；对象文本 ${scan.objectText} 条；DOM补全文本 ${scan.domText} 条；可读文本楼层 ${scan.textMessages} 条。\n\n这会调用总结模型逐轮补录，聊天越长耗时越久。是否开始？`);
         if (!ok) return;
     }
 
@@ -1544,8 +1782,17 @@ async function rescanCurrentChat({ confirmFirst = true, clearFirst = true, label
         if (state.processedPairs.includes(exchange.pairKey)) continue;
         try {
             updateStatus(`一键记忆历史聊天：${i + 1}/${pairs.length}`);
-            const raw = await callMemoryModel(buildPairPrompt({ ...exchange, state }), { json: true });
-            const json = parseJsonLoose(raw);
+            let json = {};
+            let usedFallback = false;
+            try {
+                const raw = await callMemoryModel(buildPairPrompt({ ...exchange, state }), { json: true });
+                json = parseJsonLoose(raw);
+            } catch (innerError) {
+                // 历史补录时经常会遇到旧记录过长、模型空回复、非 JSON 等情况。
+                // 不让整段补录失败，先用可读文本生成兜底简记，后续阶段总结仍会继续压缩。
+                usedFallback = true;
+                warn('history pair used fallback brief', innerError);
+            }
             const nextId = (state.records.at(-1)?.id || 0) + 1;
             state.records.push({
                 id: nextId,
@@ -1556,6 +1803,7 @@ async function rescanCurrentChat({ confirmFirst = true, clearFirst = true, label
                 user: exchange.userText,
                 ai: exchange.aiText,
                 brief: String(json.brief || '').trim() || fallbackBrief(exchange),
+                fallback: usedFallback,
                 createdAt: nowIso(),
             });
             state.tracker = normalizeTracker(json.tracker, state.tracker);
@@ -1564,6 +1812,7 @@ async function rescanCurrentChat({ confirmFirst = true, clearFirst = true, label
             state.records = state.records.slice(-clampNumber(s.maxRecordsStored, 50, 5000, DEFAULT_SETTINGS.maxRecordsStored));
             await maybeCreateChunkSummary(state);
             await maybeCreateMegaSummary(state);
+            await hideSummarizedBriefFolds(state);
             okCount += 1;
             if (okCount % saveEvery === 0) {
                 await saveState();
@@ -1849,6 +2098,7 @@ function renderSettingsPanel() {
                 <label class="rmf-switch"><input id="rmf_auto" type="checkbox"><span></span><b>AI 回复后实时填表</b></label>
                 <label class="rmf-switch"><input id="rmf_autoSyncWorldBook" type="checkbox"><span></span><b>自动同步到世界书</b></label>
                 <label class="rmf-switch"><input id="rmf_appendBrief" type="checkbox"><span></span><b>回复结尾折叠简记</b></label>
+                <label class="rmf-switch"><input id="rmf_autoHideSummarizedBriefs" type="checkbox"><span></span><b>总结后隐藏旧简记</b></label>
                 <label class="rmf-switch"><input id="rmf_keep" type="checkbox"><span></span><b>新聊天保留记忆</b></label>
             </div>
 
@@ -1949,6 +2199,7 @@ function renderSettingsPanel() {
                             <label class="rmf-checkline"><input id="rmf_cleanup" type="checkbox"> 关闭插件时清理当前记忆</label>
                             <label class="rmf-checkline"><input id="rmf_toast" type="checkbox"> 显示提示消息</label>
                             <label class="rmf-checkline"><input id="rmf_raw" type="checkbox"> 保存 JSON_RAW 世界书条目</label>
+                            <label class="rmf-checkline"><input id="rmf_shujukuAcuCompatibleIndex" type="checkbox"> 同步 shujuku/TavernDB-ACU 兼容 Index 数据表</label>
                         </div>
                     </details>
 
@@ -1995,8 +2246,10 @@ function bindPanelEvents() {
         rmf_auto: ['autoProcess', 'checked'],
         rmf_autoSyncWorldBook: ['autoSyncWorldBook', 'checked'],
         rmf_appendBrief: ['appendBriefToMessage', 'checked'],
+        rmf_autoHideSummarizedBriefs: ['autoHideSummarizedBriefs', 'checked'],
         rmf_toast: ['showToast', 'checked'],
         rmf_raw: ['includeRawJsonEntry', 'checked'],
+        rmf_shujukuAcuCompatibleIndex: ['shujukuAcuCompatibleIndex', 'checked'],
         rmf_source: ['source', 'value'],
         rmf_baseUrl: ['baseUrl', 'value'],
         rmf_apiKey: ['apiKey', 'value'],
@@ -2078,8 +2331,10 @@ function refreshPanelValues() {
     set('rmf_auto', !!s.autoProcess, 'checked');
     set('rmf_autoSyncWorldBook', !!s.autoSyncWorldBook, 'checked');
     set('rmf_appendBrief', !!s.appendBriefToMessage, 'checked');
+    set('rmf_autoHideSummarizedBriefs', !!s.autoHideSummarizedBriefs, 'checked');
     set('rmf_toast', !!s.showToast, 'checked');
     set('rmf_raw', !!s.includeRawJsonEntry, 'checked');
+    set('rmf_shujukuAcuCompatibleIndex', !!s.shujukuAcuCompatibleIndex, 'checked');
     set('rmf_source', s.source);
     set('rmf_baseUrl', s.baseUrl);
     set('rmf_apiKey', s.apiKey);
@@ -2255,7 +2510,7 @@ function refreshDashboard() {
     el.innerHTML = `
         <div class="rmf-statline">
             <span>同步目标 <b>${escapeForHtml(getWorldTargetLabel())}</b></span>
-            <span>简记 <b>${state.records.length}</b></span>
+            <span>简记 <b>${state.records.length}</b> / 显示 <b>${visibleRecordsForDisplay(state).length}</b></span>
             <span>阶段总结 <b>${state.summaries.length}</b> / 未合并 <b>${pending}</b></span>
             <span>大总结 <b>${state.megaSummary.content ? '有' : '无'}</b></span>
             <span>走马灯 <b>${state.walkthrough?.content ? '有' : '无'}</b></span>
@@ -2280,7 +2535,7 @@ function refreshDashboard() {
         </details>
         <details class="rmf-dash-block">
             <summary>最近简记</summary>
-            <ol class="rmf-record-list">${state.records.slice(-8).map((r) => `<li><b>#${r.id}</b> ${escapeForHtml(r.brief)}</li>`).join('') || '<li>暂无</li>'}</ol>
+            <ol class="rmf-record-list">${visibleRecordsForDisplay(state).slice(-8).map((r) => `<li><b>#${r.id}</b> ${escapeForHtml(r.brief)}</li>`).join('') || '<li>暂无未总结简记</li>'}</ol>
         </details>
         <details open class="rmf-dash-block">
             <summary>Index 数据表</summary>
