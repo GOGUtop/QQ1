@@ -41,6 +41,10 @@ const DEFAULT_SETTINGS = Object.freeze({
     showToast: true,
     autoProcess: true,
     includeRawJsonEntry: true,
+    appendBriefToMessage: true,
+    briefFoldTitle: '🧠 本轮记忆简记',
+    showFloatingPanel: true,
+    relationGraphMaxNodes: 10,
 });
 
 function context() {
@@ -83,10 +87,17 @@ function nowIso() {
     return new Date().toISOString();
 }
 
+function stripRmfFoldHtml(input = '') {
+    return String(input ?? '')
+        .replace(/\n*<!--RMF_BRIEF_START-->[\s\S]*?<!--RMF_BRIEF_END-->\s*/gi, '')
+        .replace(/\n*<details\b[^>]*(?:rmf-brief-fold|data-rmf-brief)[\s\S]*?<\/details>\s*/gi, '')
+        .trim();
+}
+
 function stripHtml(input = '') {
     const div = document.createElement('div');
-    div.innerHTML = String(input ?? '');
-    return (div.textContent || div.innerText || String(input ?? ''))
+    div.innerHTML = stripRmfFoldHtml(String(input ?? ''));
+    return (div.textContent || div.innerText || stripRmfFoldHtml(String(input ?? '')))
         .replace(/\u200b/g, '')
         .replace(/\s+\n/g, '\n')
         .replace(/\n{3,}/g, '\n\n')
@@ -701,6 +712,8 @@ async function processLatestExchange({ force = false } = {}) {
         await maybeCreateMegaSummary(state);
         await saveState();
         await writeWorldBook();
+        await appendBriefToAiMessage(state.records.at(-1));
+        refreshDashboard();
         updateStatus('记忆已更新。');
     } catch (error) {
         const state = getState();
@@ -737,6 +750,56 @@ function fallbackBrief(exchange) {
     const u = exchange.userText.slice(0, 120);
     const a = exchange.aiText.slice(0, 160);
     return `User 表达/行动：${u}；${exchange.aiName}回应/行动：${a}`;
+}
+
+function buildBriefFoldHtml(record) {
+    const title = settings().briefFoldTitle || DEFAULT_SETTINGS.briefFoldTitle;
+    return [
+        '\n\n<!--RMF_BRIEF_START-->',
+        `<details class="rmf-brief-fold" data-rmf-brief="${record.id}">`,
+        `<summary>${escapeForHtml(title)} #${record.id}</summary>`,
+        `<div class="rmf-brief-body">${escapeForHtml(record.brief)}</div>`,
+        '</details>',
+        '<!--RMF_BRIEF_END-->',
+    ].join('');
+}
+
+async function saveChatAfterMessagePatch() {
+    const ctx = context();
+    if (typeof ctx.saveChat === 'function') {
+        await ctx.saveChat();
+        return;
+    }
+    if (typeof ctx.saveChatConditional === 'function') {
+        await ctx.saveChatConditional();
+        return;
+    }
+    if (typeof ctx.saveChatDebounced === 'function') {
+        ctx.saveChatDebounced();
+        return;
+    }
+}
+
+async function appendBriefToAiMessage(record) {
+    const s = settings();
+    if (!s.appendBriefToMessage || !record) return;
+    try {
+        const chat = context().chat || [];
+        const msg = chat[record.aiIndex];
+        if (!msg || msg.is_user || msg.is_system) return;
+        const clean = stripRmfFoldHtml(msg.mes || '');
+        msg.mes = `${clean}${buildBriefFoldHtml(record)}`;
+        await saveChatAfterMessagePatch();
+
+        // 轻量刷新已渲染的最后一条消息：不同 ST 版本 DOM 结构不完全一致，失败也不影响存档。
+        const rendered = document.querySelector(`.mes[mesid="${record.aiIndex}"] .mes_text`)
+            || document.querySelector(`.mes[mesid='${record.aiIndex}'] .mes_text`);
+        if (rendered) {
+            rendered.insertAdjacentHTML('beforeend', buildBriefFoldHtml(record));
+        }
+    } catch (error) {
+        warn('appendBriefToAiMessage failed', error);
+    }
 }
 
 async function maybeCreateChunkSummary(state) {
@@ -855,74 +918,145 @@ async function rescanCurrentChat() {
 function renderSettingsPanel() {
     if (document.querySelector('#rmf_settings')) return;
     const html = `
-    <div id="rmf_settings" class="rmf-panel">
-        <div class="rmf-head">
-            <div>
-                <strong>Role Memory Forge</strong>
-                <small>分层总结 / 实时填表 / 世界书记忆</small>
+    <button id="rmf_float_button" class="rmf-float" title="Role Memory Forge">
+        <span>🧠</span>
+        <em id="rmf_float_badge">0</em>
+    </button>
+
+    <div id="rmf_modal" class="rmf-modal rmf-hidden" aria-hidden="true">
+        <div id="rmf_backdrop" class="rmf-backdrop"></div>
+        <section id="rmf_settings" class="rmf-panel rmf-window" role="dialog" aria-label="Role Memory Forge">
+            <div class="rmf-hero">
+                <div class="rmf-orb">✦</div>
+                <div class="rmf-titlebox">
+                    <strong>Role Memory Forge</strong>
+                    <small>分层总结 / 实时填表 / 关系网络 / 世界书记忆</small>
+                </div>
+                <span id="rmf_status" class="rmf-status">待机</span>
+                <button id="rmf_close" class="rmf-icon-btn" title="关闭">×</button>
             </div>
-            <span id="rmf_status">待机</span>
-        </div>
 
-        <label class="checkbox_label"><input id="rmf_enabled" type="checkbox"> 启用记忆插件</label>
-        <label class="checkbox_label"><input id="rmf_keep" type="checkbox"> 新聊天保留这张角色卡的旧记忆</label>
-        <label class="checkbox_label"><input id="rmf_cleanup" type="checkbox"> 关闭插件时清理当前记忆</label>
-        <label class="checkbox_label"><input id="rmf_auto" type="checkbox"> 每次 AI 回复后自动实时填表</label>
-        <label class="checkbox_label"><input id="rmf_toast" type="checkbox"> 显示提示消息</label>
+            <div class="rmf-quick-row">
+                <label class="rmf-switch"><input id="rmf_enabled" type="checkbox"><span></span><b>启用记忆</b></label>
+                <label class="rmf-switch"><input id="rmf_auto" type="checkbox"><span></span><b>AI 回复后实时填表</b></label>
+                <label class="rmf-switch"><input id="rmf_appendBrief" type="checkbox"><span></span><b>回复结尾折叠简记</b></label>
+                <label class="rmf-switch"><input id="rmf_keep" type="checkbox"><span></span><b>新聊天保留记忆</b></label>
+            </div>
 
-        <div class="rmf-grid">
-            <label>总结来源
-                <select id="rmf_source">
-                    <option value="st">使用 SillyTavern 当前 API（推荐）</option>
-                    <option value="openai">自填 OpenAI-compatible 地址/密钥/模型</option>
-                </select>
-            </label>
-            <label>API 地址/端口
-                <input id="rmf_baseUrl" type="text" placeholder="https://api.openai.com/v1 或 http://127.0.0.1:8000/v1">
-            </label>
-            <label>API Key
-                <input id="rmf_apiKey" type="password" autocomplete="off" placeholder="sk-...">
-            </label>
-            <label>模型名
-                <input id="rmf_model" type="text" placeholder="gpt-4o-mini / deepseek-chat / Qwen...">
-            </label>
-            <label>每多少条简记生成阶段总结
-                <input id="rmf_chunkSize" type="number" min="2" max="100">
-            </label>
-            <label>多少个阶段总结生成大总结
-                <input id="rmf_megaEvery" type="number" min="2" max="20">
-            </label>
-            <label>注入深度
-                <input id="rmf_injectDepth" type="number" min="0" max="100">
-            </label>
-            <label>最大注入字符
-                <input id="rmf_injectMaxChars" type="number" min="1000" max="50000">
-            </label>
-            <label>最近简记注入数量
-                <input id="rmf_recentRecordCount" type="number" min="0" max="50">
-            </label>
-            <label>世界书命名模板
-                <input id="rmf_worldNameTemplate" type="text" placeholder="RMF-{{char}}-记忆世界书">
-            </label>
-        </div>
+            <div class="rmf-layout">
+                <aside class="rmf-side-card">
+                    <div class="rmf-side-title">当前状态</div>
+                    <div id="rmf_dashboard" class="rmf-dashboard"></div>
+                </aside>
 
-        <div class="rmf-actions">
-            <button id="rmf_process" class="menu_button">手动记录最新一轮</button>
-            <button id="rmf_rescan" class="menu_button">补录当前聊天</button>
-            <button id="rmf_sync" class="menu_button">同步到世界书</button>
-            <button id="rmf_export" class="menu_button">导出 JSON</button>
-            <button id="rmf_clear" class="menu_button danger">清空当前记忆</button>
-        </div>
+                <main class="rmf-main-card">
+                    <details open class="rmf-section">
+                        <summary>API 与模型</summary>
+                        <div class="rmf-grid">
+                            <label>总结来源
+                                <select id="rmf_source">
+                                    <option value="st">使用 SillyTavern 当前 API（推荐）</option>
+                                    <option value="openai">自填 OpenAI-compatible 地址/密钥/模型</option>
+                                </select>
+                            </label>
+                            <label>API 地址/端口
+                                <input id="rmf_baseUrl" type="text" placeholder="https://api.openai.com/v1 或 http://127.0.0.1:8000/v1">
+                            </label>
+                            <label>API Key
+                                <input id="rmf_apiKey" type="password" autocomplete="off" placeholder="sk-...">
+                            </label>
+                            <label>模型名
+                                <input id="rmf_model" type="text" placeholder="gpt-4o-mini / deepseek-chat / Qwen...">
+                            </label>
+                            <label>最大输出 Token
+                                <input id="rmf_maxOutputTokens" type="number" min="128" max="8000">
+                            </label>
+                            <label>温度
+                                <input id="rmf_temperature" type="number" min="0" max="1" step="0.05">
+                            </label>
+                        </div>
+                    </details>
 
-        <div id="rmf_dashboard" class="rmf-dashboard"></div>
-        <div class="rmf-note">提示：自填 API Key 会保存在 ST 扩展设置里；更安全的方式是选择“使用 SillyTavern 当前 API”。浏览器直连某些 API 可能被 CORS 拦截。</div>
+                    <details open class="rmf-section">
+                        <summary>记忆规则</summary>
+                        <div class="rmf-grid">
+                            <label>每多少条简记生成阶段总结
+                                <input id="rmf_chunkSize" type="number" min="2" max="100">
+                            </label>
+                            <label>多少个阶段总结生成大总结
+                                <input id="rmf_megaEvery" type="number" min="2" max="20">
+                            </label>
+                            <label>最近简记注入数量
+                                <input id="rmf_recentRecordCount" type="number" min="0" max="50">
+                            </label>
+                            <label>最多保存简记数量
+                                <input id="rmf_maxRecordsStored" type="number" min="50" max="5000">
+                            </label>
+                            <label>注入深度
+                                <input id="rmf_injectDepth" type="number" min="0" max="100">
+                            </label>
+                            <label>最大注入字符
+                                <input id="rmf_injectMaxChars" type="number" min="1000" max="50000">
+                            </label>
+                        </div>
+                    </details>
+
+                    <details open class="rmf-section">
+                        <summary>显示与世界书</summary>
+                        <div class="rmf-grid">
+                            <label>折叠简记标题
+                                <input id="rmf_briefFoldTitle" type="text" placeholder="🧠 本轮记忆简记">
+                            </label>
+                            <label>关系图最多节点
+                                <input id="rmf_relationGraphMaxNodes" type="number" min="4" max="24">
+                            </label>
+                            <label>世界书命名模板
+                                <input id="rmf_worldNameTemplate" type="text" placeholder="RMF-{{char}}-记忆世界书">
+                            </label>
+                            <label class="rmf-checkline"><input id="rmf_cleanup" type="checkbox"> 关闭插件时清理当前记忆</label>
+                            <label class="rmf-checkline"><input id="rmf_toast" type="checkbox"> 显示提示消息</label>
+                            <label class="rmf-checkline"><input id="rmf_raw" type="checkbox"> 保存 JSON_RAW 世界书条目</label>
+                        </div>
+                    </details>
+
+                    <div class="rmf-actions">
+                        <button id="rmf_process" class="menu_button">手动记录最新一轮</button>
+                        <button id="rmf_rescan" class="menu_button">补录当前聊天</button>
+                        <button id="rmf_sync" class="menu_button">同步到世界书</button>
+                        <button id="rmf_export" class="menu_button">导出 JSON</button>
+                        <button id="rmf_clear" class="menu_button danger">清空当前记忆</button>
+                    </div>
+
+                    <div class="rmf-note">提示：折叠简记会追加到 AI 最新回复末尾；如不想增加聊天正文长度，可以关闭“回复结尾折叠简记”。自填 API Key 会保存在 ST 扩展设置里；更安全的方式是选择“使用 SillyTavern 当前 API”。浏览器直连某些 API 可能被 CORS 拦截。</div>
+                </main>
+            </div>
+        </section>
     </div>`;
 
-    const root = document.querySelector('#extensions_settings') || document.querySelector('#extensions_settings2') || document.body;
-    root.insertAdjacentHTML('beforeend', html);
+    document.body.insertAdjacentHTML('beforeend', html);
     bindPanelEvents();
+    bindFloatingPanelEvents();
     refreshPanelValues();
     refreshDashboard();
+}
+
+function bindFloatingPanelEvents() {
+    const modal = document.querySelector('#rmf_modal');
+    const open = () => {
+        modal?.classList.remove('rmf-hidden');
+        modal?.setAttribute('aria-hidden', 'false');
+        refreshDashboard();
+    };
+    const close = () => {
+        modal?.classList.add('rmf-hidden');
+        modal?.setAttribute('aria-hidden', 'true');
+    };
+    document.querySelector('#rmf_float_button')?.addEventListener('click', open);
+    document.querySelector('#rmf_backdrop')?.addEventListener('click', close);
+    document.querySelector('#rmf_close')?.addEventListener('click', close);
+    document.addEventListener('keydown', (event) => {
+        if (event.key === 'Escape') close();
+    });
 }
 
 function bindPanelEvents() {
@@ -931,16 +1065,23 @@ function bindPanelEvents() {
         rmf_keep: ['keepAcrossNewChats', 'checked'],
         rmf_cleanup: ['cleanupWhenDisabled', 'checked'],
         rmf_auto: ['autoProcess', 'checked'],
+        rmf_appendBrief: ['appendBriefToMessage', 'checked'],
         rmf_toast: ['showToast', 'checked'],
+        rmf_raw: ['includeRawJsonEntry', 'checked'],
         rmf_source: ['source', 'value'],
         rmf_baseUrl: ['baseUrl', 'value'],
         rmf_apiKey: ['apiKey', 'value'],
         rmf_model: ['model', 'value'],
+        rmf_maxOutputTokens: ['maxOutputTokens', 'value'],
+        rmf_temperature: ['temperature', 'value'],
         rmf_chunkSize: ['chunkSize', 'value'],
         rmf_megaEvery: ['megaEvery', 'value'],
         rmf_injectDepth: ['injectDepth', 'value'],
         rmf_injectMaxChars: ['injectMaxChars', 'value'],
         rmf_recentRecordCount: ['recentRecordCount', 'value'],
+        rmf_maxRecordsStored: ['maxRecordsStored', 'value'],
+        rmf_briefFoldTitle: ['briefFoldTitle', 'value'],
+        rmf_relationGraphMaxNodes: ['relationGraphMaxNodes', 'value'],
         rmf_worldNameTemplate: ['worldNameTemplate', 'value'],
     };
     for (const [id, [key, prop]] of Object.entries(map)) {
@@ -990,47 +1131,181 @@ function refreshPanelValues() {
     set('rmf_keep', !!s.keepAcrossNewChats, 'checked');
     set('rmf_cleanup', !!s.cleanupWhenDisabled, 'checked');
     set('rmf_auto', !!s.autoProcess, 'checked');
+    set('rmf_appendBrief', !!s.appendBriefToMessage, 'checked');
     set('rmf_toast', !!s.showToast, 'checked');
+    set('rmf_raw', !!s.includeRawJsonEntry, 'checked');
     set('rmf_source', s.source);
     set('rmf_baseUrl', s.baseUrl);
     set('rmf_apiKey', s.apiKey);
     set('rmf_model', s.model);
+    set('rmf_maxOutputTokens', s.maxOutputTokens);
+    set('rmf_temperature', s.temperature);
     set('rmf_chunkSize', s.chunkSize);
     set('rmf_megaEvery', s.megaEvery);
     set('rmf_injectDepth', s.injectDepth);
     set('rmf_injectMaxChars', s.injectMaxChars);
     set('rmf_recentRecordCount', s.recentRecordCount);
+    set('rmf_maxRecordsStored', s.maxRecordsStored);
+    set('rmf_briefFoldTitle', s.briefFoldTitle);
+    set('rmf_relationGraphMaxNodes', s.relationGraphMaxNodes);
     set('rmf_worldNameTemplate', s.worldNameTemplate);
+}
+
+function avatarUrlForName(name) {
+    const ctx = context();
+    const wanted = String(name || '').trim();
+    const char = (ctx.characters || []).find((item) => String(item?.name || '').trim() === wanted);
+    if (char?.avatar && char.avatar !== 'none') {
+        return `/thumbnail?type=avatar&file=${encodeURIComponent(char.avatar)}`;
+    }
+    return '';
+}
+
+function relationStrengthLabel(value) {
+    const n = Number(value);
+    if (!Number.isFinite(n)) return '';
+    if (n >= 80) return '极强';
+    if (n >= 55) return '明显';
+    if (n >= 25) return '微妙';
+    if (n <= -60) return '敌对';
+    if (n <= -25) return '紧张';
+    return '中性';
+}
+
+function collectRelationGraph(state) {
+    const relationships = Array.isArray(state?.tracker?.relationships) ? state.tracker.relationships : [];
+    const main = getCharacterName();
+    const scores = new Map([[main, 999]]);
+    for (const r of relationships) {
+        const from = String(r.from || '').trim();
+        const to = String(r.to || '').trim();
+        if (!from || !to) continue;
+        scores.set(from, (scores.get(from) || 0) + 1);
+        scores.set(to, (scores.get(to) || 0) + 1);
+    }
+    const center = scores.has(main) ? main : [...scores.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] || main;
+    const maxNodes = clampNumber(settings().relationGraphMaxNodes, 4, 24, DEFAULT_SETTINGS.relationGraphMaxNodes);
+    const names = [...scores.keys()]
+        .filter((name) => name && name !== center)
+        .sort((a, b) => (scores.get(b) || 0) - (scores.get(a) || 0))
+        .slice(0, maxNodes - 1);
+    const all = [center, ...names];
+    const allowed = new Set(all);
+    const edges = relationships
+        .filter((r) => allowed.has(String(r.from || '').trim()) && allowed.has(String(r.to || '').trim()))
+        .slice(0, 40);
+    return { center, names, all, edges };
+}
+
+function buildRelationGraphHtml(state) {
+    const { center, names, all, edges } = collectRelationGraph(state);
+    if (!edges.length && !names.length) {
+        return `<div class="rmf-empty-graph">暂无人物关系，继续聊天后这里会生成关系网络。</div>`;
+    }
+
+    const positions = new Map();
+    positions.set(center, { x: 50, y: 48, center: true });
+    const radiusX = names.length <= 4 ? 34 : 38;
+    const radiusY = names.length <= 4 ? 28 : 33;
+    names.forEach((name, index) => {
+        const angle = (-90 + index * (360 / Math.max(names.length, 1))) * Math.PI / 180;
+        positions.set(name, {
+            x: 50 + Math.cos(angle) * radiusX,
+            y: 48 + Math.sin(angle) * radiusY,
+            center: false,
+        });
+    });
+
+    const nodeHtml = all.map((name) => {
+        const pos = positions.get(name);
+        const avatar = avatarUrlForName(name);
+        const initial = escapeForHtml(name.slice(0, 2) || '?');
+        return `<div class="rmf-node ${pos.center ? 'is-center' : ''}" style="left:${pos.x}%;top:${pos.y}%">
+            <div class="rmf-avatar">${avatar ? `<img src="${avatar}" alt="">` : `<span>${initial}</span>`}</div>
+            <div class="rmf-node-name">${escapeForHtml(name)}</div>
+        </div>`;
+    }).join('');
+
+    const svgEdges = edges.map((r, index) => {
+        const from = String(r.from || '').trim();
+        const to = String(r.to || '').trim();
+        const a = positions.get(from);
+        const b = positions.get(to);
+        if (!a || !b) return '';
+        const relation = escapeForHtml(String(r.relation || r.attitude || '关系').slice(0, 12));
+        const strength = relationStrengthLabel(r.tension);
+        const label = strength ? `${relation} · ${strength}` : relation;
+        const mx = (a.x + b.x) / 2;
+        const my = (a.y + b.y) / 2;
+        return `<g class="rmf-edge">
+            <line x1="${a.x}" y1="${a.y}" x2="${b.x}" y2="${b.y}"></line>
+            <text x="${mx}" y="${my - 1}" text-anchor="middle">${label}</text>
+        </g>`;
+    }).join('');
+
+    return `<div class="rmf-graph-wrap">
+        <svg class="rmf-graph-lines" viewBox="0 0 100 100" preserveAspectRatio="none">${svgEdges}</svg>
+        ${nodeHtml}
+    </div>`;
+}
+
+function buildRelationshipCards(state) {
+    const relationships = Array.isArray(state?.tracker?.relationships) ? state.tracker.relationships : [];
+    if (!relationships.length) return '<div class="rmf-muted">暂无关系记录。</div>';
+    return relationships.slice(0, 18).map((r) => `
+        <div class="rmf-relation-card">
+            <b>${escapeForHtml(r.from || '未知')}</b>
+            <span>${escapeForHtml(r.relation || '关系')}</span>
+            <b>${escapeForHtml(r.to || '未知')}</b>
+            <small>${escapeForHtml(r.attitude || r.status || r.evidence || '')}</small>
+        </div>`).join('');
 }
 
 function refreshDashboard() {
     const el = document.querySelector('#rmf_dashboard');
-    if (!el) return;
+    const badge = document.querySelector('#rmf_float_badge');
+    const floatButton = document.querySelector('#rmf_float_button');
+    if (!el && !badge && !floatButton) return;
     const state = getState();
     const pending = state.summaries.filter((s) => !s.consolidated).length;
+    if (badge) badge.textContent = String(state.records.length || 0);
+    if (floatButton) {
+        floatButton.classList.toggle('is-disabled', !settings().enabled);
+        floatButton.title = settings().enabled ? 'Role Memory Forge 已启用' : 'Role Memory Forge 未启用';
+    }
+    if (!el) return;
     el.innerHTML = `
         <div class="rmf-statline">
-            <span>世界书：<b>${escapeForHtml(state.worldName || getWorldName())}</b></span>
-            <span>简记：<b>${state.records.length}</b></span>
-            <span>阶段总结：<b>${state.summaries.length}</b> / 未合并 <b>${pending}</b></span>
-            <span>大总结：<b>${state.megaSummary.content ? '有' : '无'}</b></span>
+            <span>世界书 <b>${escapeForHtml(state.worldName || getWorldName())}</b></span>
+            <span>简记 <b>${state.records.length}</b></span>
+            <span>阶段总结 <b>${state.summaries.length}</b> / 未合并 <b>${pending}</b></span>
+            <span>大总结 <b>${state.megaSummary.content ? '有' : '无'}</b></span>
         </div>
         ${state.lastError ? `<div class="rmf-error">${escapeForHtml(state.lastError)}</div>` : ''}
-        <details open>
-            <summary>当前剧情</summary>
-            <div>${escapeForHtml(state.tracker.currentPlot || '暂无')}</div>
+        <details open class="rmf-dash-block">
+            <summary>人物关系网络</summary>
+            ${buildRelationGraphHtml(state)}
+            <div class="rmf-relation-list">${buildRelationshipCards(state)}</div>
         </details>
-        <details>
-            <summary>人物关系表</summary>
+        <details open class="rmf-dash-block">
+            <summary>当前剧情</summary>
+            <div class="rmf-text-box">${escapeForHtml(state.tracker.currentPlot || '暂无')}</div>
+        </details>
+        <details class="rmf-dash-block">
+            <summary>发展方向</summary>
+            <div class="rmf-text-box">${escapeForHtml(state.tracker.development || '暂无')}</div>
+        </details>
+        <details class="rmf-dash-block">
+            <summary>最近简记</summary>
+            <ol class="rmf-record-list">${state.records.slice(-8).map((r) => `<li><b>#${r.id}</b> ${escapeForHtml(r.brief)}</li>`).join('') || '<li>暂无</li>'}</ol>
+        </details>
+        <details class="rmf-dash-block">
+            <summary>人物关系 Markdown</summary>
             <pre>${escapeForHtml(state.tracker.relationTableMarkdown || buildRelationMarkdown(state.tracker.relationships))}</pre>
         </details>
-        <details>
-            <summary>最近简记</summary>
-            <ol>${state.records.slice(-8).map((r) => `<li>${escapeForHtml(r.brief)}</li>`).join('') || '<li>暂无</li>'}</ol>
-        </details>
-        <details>
+        <details class="rmf-dash-block">
             <summary>大总结</summary>
-            <div>${escapeForHtml(state.megaSummary.content || '暂无')}</div>
+            <div class="rmf-text-box">${escapeForHtml(state.megaSummary.content || '暂无')}</div>
         </details>
     `;
 }
