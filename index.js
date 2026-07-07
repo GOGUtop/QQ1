@@ -1,4 +1,4 @@
-// Role Memory Forge v0.4.2
+// Role Memory Forge v0.4.3
 // 这一版不再使用会直接炸掉插件的静态 import。
 // SillyTavern 内部模块路径有时会随版本变化，静态 import 一旦失败，悬浮球和入口都会消失。
 // 这里改为：先渲染 UI，再动态按需加载 ST API / WorldInfo API。
@@ -192,6 +192,8 @@ const DEFAULT_SETTINGS = Object.freeze({
     appendBriefToMessage: true,
     autoHideSummarizedBriefs: true,
     shujukuAcuCompatibleIndex: true,
+    shujukuAcuChatDataSync: true,
+    autoFallbackRelationGraph: true,
     briefFoldTitle: '🧠 本轮记忆简记',
     showFloatingPanel: true,
     relationGraphMaxNodes: 10,
@@ -803,8 +805,56 @@ function toIndexTableText(table) {
     ].join('\n');
 }
 
+function collectRelationshipRows(state = getState()) {
+    const direct = Array.isArray(state?.tracker?.relationships) ? state.tracker.relationships : [];
+    const rows = [];
+    const seen = new Map();
+    const push = (item) => {
+        const from = safeCell(item?.from || item?.人物A || item?.a || '', 80);
+        const to = safeCell(item?.to || item?.人物B || item?.b || '', 80);
+        if (!from || !to || from === to) return;
+        const key = `${from}=>${to}`;
+        const row = {
+            from,
+            to,
+            relation: safeCell(item?.relation || item?.关系 || '互动', 120),
+            attitude: safeCell(item?.attitude || item?.status || item?.当前状态 || '已有共同剧情记录', 240),
+            tension: Number.isFinite(Number(item?.tension)) ? Number(item.tension) : '',
+            evidence: safeCell(item?.evidence || item?.证据 || '', 360),
+        };
+        if (seen.has(key)) rows[seen.get(key)] = row;
+        else {
+            seen.set(key, rows.length);
+            rows.push(row);
+        }
+    };
+    direct.forEach(push);
+
+    // 兜底：如果模型只给了“简记”但没填 relationships，仍然根据每轮 user/AI 自动生成基础关系线。
+    if ((!rows.length || settings().autoFallbackRelationGraph) && Array.isArray(state?.records)) {
+        const recentByPair = new Map();
+        for (const r of state.records) {
+            const from = safeCell(r.userName || '{{user}}', 80);
+            const to = safeCell(r.aiName || state.characterName || getCharacterName(), 80);
+            if (!from || !to || from === to) continue;
+            recentByPair.set(`${from}=>${to}`, { from, to, brief: r.brief || fallbackBrief(r), id: r.id });
+        }
+        for (const item of recentByPair.values()) {
+            push({
+                from: item.from,
+                to: item.to,
+                relation: rows.length ? '持续互动' : '主线互动',
+                attitude: `已有 ${state.records.length} 条简记；最近：#${item.id}`,
+                tension: rows.length ? '' : 30,
+                evidence: item.brief,
+            });
+        }
+    }
+    return rows;
+}
+
 function buildRelationIndexTable(state = getState()) {
-    const rows = (Array.isArray(state?.tracker?.relationships) ? state.tracker.relationships : []).map((r, index) => [
+    const rows = collectRelationshipRows(state).map((r, index) => [
         index + 1,
         r.from || '',
         r.to || '',
@@ -931,10 +981,20 @@ function toAcuSheet(table, index) {
     };
 }
 
-function buildAcuCompatibleDatabase(state = getState()) {
-    const result = {};
-    buildAllIndexTables(state).forEach((table, index) => {
-        result[String(index)] = toAcuSheet(table, index);
+function buildAcuCompatibleDatabase(state = getState(), { includeAllTables = true } = {}) {
+    // shujuku / TavernDB-ACU 读取聊天内数据时，表 key 需要是 sheet_0、sheet_1……，并且 content 第一列保留 null。
+    // 旧版 RMF 只写 0/1/2，ACU 不会当成有效表，所以这里改成真正的 sheet_* 结构。
+    const result = {
+        mate: {
+            type: 'chatSheets',
+            version: 1,
+            source: 'Role Memory Forge',
+            updatedAt: nowIso(),
+        },
+    };
+    const tables = includeAllTables ? buildAllIndexTables(state) : [buildSummaryIndexTable(state), buildRecordIndexTable(state)];
+    tables.forEach((table, index) => {
+        result[`sheet_${index}`] = toAcuSheet(table, index);
     });
     return result;
 }
@@ -965,6 +1025,33 @@ function upsertAcuIndexEntry(data, content) {
     let entry = Object.values(data.entries || {}).find((x) => x.comment === ACU_INDEX_ENTRY_COMMENT);
     if (!entry) entry = createWorldInfoEntry('', data);
     return configureAcuIndexEntry(entry, content);
+}
+
+function getLatestAssistantMessageForAcuSync() {
+    const chat = context().chat || [];
+    for (let i = chat.length - 1; i >= 0; i--) {
+        const msg = chat[i];
+        if (!msg || msg.is_user || msg.is_system) continue;
+        if (isRmfUtilityMessage(msg)) continue;
+        return msg;
+    }
+    return null;
+}
+
+async function syncAcuDataToLatestAssistantMessage(state = getState()) {
+    if (!settings().shujukuAcuChatDataSync) return false;
+    const msg = getLatestAssistantMessageForAcuSync();
+    if (!msg) return false;
+    const allData = buildAcuCompatibleDatabase(state, { includeAllTables: true });
+    const summaryData = buildAcuCompatibleDatabase(state, { includeAllTables: false });
+    msg.TavernDB_ACU_IndependentData = allData;
+    msg.TavernDB_ACU_Data = allData;
+    msg.TavernDB_ACU_SummaryData = summaryData;
+    msg.TavernDB_ACU_Identity = 'RMF';
+    msg.TavernDB_ACU_RMF = true;
+    msg.TavernDB_ACU_RMF_UpdatedAt = nowIso();
+    await saveChatAfterMessagePatch();
+    return true;
 }
 
 
@@ -1553,7 +1640,7 @@ async function processLatestExchange({ force = false } = {}) {
         const raw = await callMemoryModel(buildPairPrompt({ ...exchange, state }), { json: true });
         const json = parseJsonLoose(raw);
         const brief = String(json.brief || '').trim() || fallbackBrief(exchange);
-        const tracker = normalizeTracker(json.tracker, state.tracker);
+        const tracker = enrichTrackerWithExchange(normalizeTracker(json.tracker, state.tracker), exchange, brief);
 
         const nextId = (state.records.at(-1)?.id || 0) + 1;
         state.records.push({
@@ -1580,6 +1667,7 @@ async function processLatestExchange({ force = false } = {}) {
         if (settings().autoSyncWorldBook) {
             await writeWorldBook();
         }
+        await syncAcuDataToLatestAssistantMessage(state).catch((error) => warn('ACU chat data sync failed', error));
         await appendBriefToAiMessage(state.records.at(-1));
         refreshDashboard();
         updateStatus('记忆已更新。');
@@ -1599,18 +1687,83 @@ async function processLatestExchange({ force = false } = {}) {
     }
 }
 
+function normalizeRelationshipItem(item) {
+    const from = safeCell(item?.from || item?.人物A || item?.a || '', 80);
+    const to = safeCell(item?.to || item?.人物B || item?.b || '', 80);
+    if (!from || !to || from === to) return null;
+    return {
+        from,
+        to,
+        relation: safeCell(item?.relation || item?.关系 || '互动', 120),
+        attitude: safeCell(item?.attitude || item?.status || item?.当前状态 || '已有互动', 240),
+        tension: Number.isFinite(Number(item?.tension)) ? Number(item.tension) : '',
+        evidence: safeCell(item?.evidence || item?.证据 || '', 360),
+    };
+}
+
+function mergeRelationshipLists(previous = [], next = []) {
+    const rows = [];
+    const seen = new Map();
+    const push = (item) => {
+        const r = normalizeRelationshipItem(item);
+        if (!r) return;
+        const key = `${r.from}=>${r.to}`;
+        if (seen.has(key)) rows[seen.get(key)] = { ...rows[seen.get(key)], ...r };
+        else {
+            seen.set(key, rows.length);
+            rows.push(r);
+        }
+    };
+    (Array.isArray(previous) ? previous : []).forEach(push);
+    (Array.isArray(next) ? next : []).forEach(push);
+    return rows.slice(-80);
+}
+
+function makeFallbackTrackerFromExchange(exchange, brief = '') {
+    const userName = safeCell(exchange?.userName || '{{user}}', 80);
+    const aiName = safeCell(exchange?.aiName || getCharacterName(), 80);
+    const evidence = safeCell(brief || fallbackBrief(exchange || {}), 360);
+    const tracker = createEmptyTracker();
+    if (userName) tracker.characterStates[userName] = `刚参与本轮互动：${evidence}`;
+    if (aiName) tracker.characterStates[aiName] = `刚回应本轮互动：${evidence}`;
+    if (userName) tracker.profiles[userName] = tracker.profiles[userName] || '当前聊天中的用户/主控角色。';
+    if (aiName) tracker.profiles[aiName] = tracker.profiles[aiName] || '当前角色卡 AI 角色。';
+    if (userName && aiName && userName !== aiName) {
+        tracker.relationships.push({
+            from: userName,
+            to: aiName,
+            relation: '主线互动',
+            attitude: '已产生对话与剧情推进',
+            tension: 30,
+            evidence,
+        });
+    }
+    tracker.currentPlot = evidence;
+    tracker.development = '等待 user 下一步行动，AI 不替 user 做决定。';
+    return tracker;
+}
+
+function enrichTrackerWithExchange(tracker, exchange, brief = '') {
+    const fallback = makeFallbackTrackerFromExchange(exchange, brief);
+    const merged = normalizeTracker(fallback, tracker);
+    if (!merged.currentPlot) merged.currentPlot = fallback.currentPlot;
+    if (!merged.development) merged.development = fallback.development;
+    merged.relationships = mergeRelationshipLists(tracker?.relationships || [], fallback.relationships || []);
+    return merged;
+}
+
 function normalizeTracker(next, previous) {
     const base = createEmptyTracker();
     const merged = { ...base, ...(previous || {}), ...(next || {}) };
     merged.characterStates = typeof merged.characterStates === 'object' && !Array.isArray(merged.characterStates) ? merged.characterStates : {};
     merged.profiles = typeof merged.profiles === 'object' && !Array.isArray(merged.profiles) ? merged.profiles : {};
-    merged.relationships = Array.isArray(merged.relationships) ? merged.relationships : [];
+    merged.relationships = mergeRelationshipLists(previous?.relationships || [], Array.isArray(merged.relationships) ? merged.relationships : []);
     merged.worldSetting = Array.isArray(merged.worldSetting) ? merged.worldSetting : [];
     merged.inventory = typeof merged.inventory === 'object' && !Array.isArray(merged.inventory) ? merged.inventory : {};
     merged.promises = Array.isArray(merged.promises) ? merged.promises : [];
     merged.currentPlot = String(merged.currentPlot || '');
     merged.development = String(merged.development || '');
-    merged.relationIndexFormat = 'RMF_INDEX_TABLE/JSON_2D_ARRAY';
+    merged.relationIndexFormat = 'RMF_INDEX_TABLE/JSON_2D_ARRAY + TavernDB_ACU sheet_*';
     return merged;
 }
 
@@ -1806,7 +1959,7 @@ async function rescanCurrentChat({ confirmFirst = true, clearFirst = true, label
                 fallback: usedFallback,
                 createdAt: nowIso(),
             });
-            state.tracker = normalizeTracker(json.tracker, state.tracker);
+            state.tracker = enrichTrackerWithExchange(normalizeTracker(json.tracker, state.tracker), exchange, String(json.brief || '').trim() || fallbackBrief(exchange));
             state.processedPairs.push(exchange.pairKey);
             state.processedPairs = state.processedPairs.slice(-Math.max(200, s.maxRecordsStored));
             state.records = state.records.slice(-clampNumber(s.maxRecordsStored, 50, 5000, DEFAULT_SETTINGS.maxRecordsStored));
@@ -1817,6 +1970,7 @@ async function rescanCurrentChat({ confirmFirst = true, clearFirst = true, label
             if (okCount % saveEvery === 0) {
                 await saveState();
                 if (settings().autoSyncWorldBook) await writeWorldBook().catch((error) => warn('history sync failed', error));
+                await syncAcuDataToLatestAssistantMessage(state).catch((error) => warn('history ACU chat data sync failed', error));
             }
         } catch (error) {
             failCount += 1;
@@ -1826,6 +1980,7 @@ async function rescanCurrentChat({ confirmFirst = true, clearFirst = true, label
 
     await saveState();
     if (settings().autoSyncWorldBook) await writeWorldBook().catch((error) => warn('history final sync failed', error));
+    await syncAcuDataToLatestAssistantMessage(getState()).catch((error) => warn('history final ACU sync failed', error));
     refreshDashboard();
     updateStatus(`历史补录完成：成功 ${okCount}，失败 ${failCount}`);
     toast(`历史聊天记忆完成：成功 ${okCount} 轮，失败 ${failCount} 轮。`, failCount ? 'warning' : 'success');
@@ -2200,6 +2355,8 @@ function renderSettingsPanel() {
                             <label class="rmf-checkline"><input id="rmf_toast" type="checkbox"> 显示提示消息</label>
                             <label class="rmf-checkline"><input id="rmf_raw" type="checkbox"> 保存 JSON_RAW 世界书条目</label>
                             <label class="rmf-checkline"><input id="rmf_shujukuAcuCompatibleIndex" type="checkbox"> 同步 shujuku/TavernDB-ACU 兼容 Index 数据表</label>
+                            <label class="rmf-checkline"><input id="rmf_shujukuAcuChatDataSync" type="checkbox"> 同步到聊天楼层 ACU sheet_* 数据</label>
+                            <label class="rmf-checkline"><input id="rmf_autoFallbackRelationGraph" type="checkbox"> 关系图没数据时自动兜底建图</label>
                         </div>
                     </details>
 
@@ -2250,6 +2407,8 @@ function bindPanelEvents() {
         rmf_toast: ['showToast', 'checked'],
         rmf_raw: ['includeRawJsonEntry', 'checked'],
         rmf_shujukuAcuCompatibleIndex: ['shujukuAcuCompatibleIndex', 'checked'],
+        rmf_shujukuAcuChatDataSync: ['shujukuAcuChatDataSync', 'checked'],
+        rmf_autoFallbackRelationGraph: ['autoFallbackRelationGraph', 'checked'],
         rmf_source: ['source', 'value'],
         rmf_baseUrl: ['baseUrl', 'value'],
         rmf_apiKey: ['apiKey', 'value'],
@@ -2310,7 +2469,8 @@ function bindPanelEvents() {
     document.querySelector('#rmf_rescan')?.addEventListener('click', () => rescanCurrentChat());
     document.querySelector('#rmf_sync')?.addEventListener('click', async () => {
         await writeWorldBook();
-        toast('已同步到世界书。', 'success');
+        await syncAcuDataToLatestAssistantMessage(getState()).catch((error) => warn('manual ACU sync failed', error));
+        toast('已同步到世界书和 ACU 数据。', 'success');
     });
     document.querySelector('#rmf_export')?.addEventListener('click', () => exportJson());
     document.querySelector('#rmf_clear')?.addEventListener('click', async () => {
@@ -2335,6 +2495,8 @@ function refreshPanelValues() {
     set('rmf_toast', !!s.showToast, 'checked');
     set('rmf_raw', !!s.includeRawJsonEntry, 'checked');
     set('rmf_shujukuAcuCompatibleIndex', !!s.shujukuAcuCompatibleIndex, 'checked');
+    set('rmf_shujukuAcuChatDataSync', !!s.shujukuAcuChatDataSync, 'checked');
+    set('rmf_autoFallbackRelationGraph', !!s.autoFallbackRelationGraph, 'checked');
     set('rmf_source', s.source);
     set('rmf_baseUrl', s.baseUrl);
     set('rmf_apiKey', s.apiKey);
@@ -2381,7 +2543,7 @@ function relationStrengthLabel(value) {
 }
 
 function collectRelationGraph(state) {
-    const relationships = Array.isArray(state?.tracker?.relationships) ? state.tracker.relationships : [];
+    const relationships = collectRelationshipRows(state);
     const main = getCharacterName();
     const scores = new Map([[main, 999]]);
     for (const r of relationships) {
@@ -2458,7 +2620,7 @@ function buildRelationGraphHtml(state) {
 }
 
 function buildRelationshipCards(state) {
-    const relationships = Array.isArray(state?.tracker?.relationships) ? state.tracker.relationships : [];
+    const relationships = collectRelationshipRows(state);
     if (!relationships.length) return '<div class="rmf-muted">暂无关系记录。</div>';
     return relationships.slice(0, 18).map((r) => `
         <div class="rmf-relation-card">
@@ -2485,10 +2647,14 @@ function renderIndexTableHtml(table, { compact = true } = {}) {
 function buildIndexTablesHtml(state) {
     const tables = [
         buildRelationIndexTable(state),
+        buildGraphNodeIndexTable(state),
+        buildGraphEdgeIndexTable(state),
         buildCharacterStateIndexTable(state),
         buildProfileIndexTable(state),
         buildInventoryIndexTable(state),
         buildPlotIndexTable(state),
+        buildRecordIndexTable(state),
+        buildSummaryIndexTable(state),
     ];
     return `<div class="rmf-index-stack">${tables.map((table) => renderIndexTableHtml(table)).join('')}</div>`;
 }
