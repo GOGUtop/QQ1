@@ -1,4 +1,4 @@
-// Role Memory Forge v0.4.4
+// Role Memory Forge v0.4.5
 // 这一版不再使用会直接炸掉插件的静态 import。
 // SillyTavern 内部模块路径有时会随版本变化，静态 import 一旦失败，悬浮球和入口都会消失。
 // 这里改为：先渲染 UI，再动态按需加载 ST API / WorldInfo API。

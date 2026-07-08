@@ -972,3 +972,66 @@
         height: 38px;
     }
 }
+
+
+/* v0.4.5 — 修复右侧开关文字被挤成竖排 */
+#rmf_settings .rmf-checkline,
+#rmf_extension_drawer .rmf-checkline {
+    display: flex !important;
+    flex-direction: row !important;
+    align-items: center !important;
+    justify-content: flex-start !important;
+    gap: 10px !important;
+    width: 100% !important;
+    min-width: 0 !important;
+    min-height: 42px !important;
+    line-height: 1.35 !important;
+    text-align: left !important;
+    white-space: normal !important;
+    word-break: normal !important;
+    overflow-wrap: break-word !important;
+    writing-mode: horizontal-tb !important;
+    text-orientation: mixed !important;
+}
+
+#rmf_settings .rmf-checkline input[type="checkbox"],
+#rmf_settings .rmf-checkline input[type="radio"],
+#rmf_extension_drawer .rmf-checkline input[type="checkbox"],
+#rmf_extension_drawer .rmf-checkline input[type="radio"] {
+    width: 18px !important;
+    height: 18px !important;
+    min-width: 18px !important;
+    max-width: 18px !important;
+    min-height: 18px !important;
+    max-height: 18px !important;
+    flex: 0 0 18px !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    appearance: auto !important;
+    -webkit-appearance: checkbox !important;
+}
+
+#rmf_settings .rmf-grid input[type="checkbox"],
+#rmf_settings .rmf-grid input[type="radio"],
+#rmf_extension_drawer .rmf-grid input[type="checkbox"],
+#rmf_extension_drawer .rmf-grid input[type="radio"] {
+    width: 18px !important;
+    height: 18px !important;
+    min-width: 18px !important;
+    max-width: 18px !important;
+    min-height: 18px !important;
+    max-height: 18px !important;
+}
+
+#rmf_settings .rmf-grid label,
+#rmf_extension_drawer .rmf-grid label {
+    writing-mode: horizontal-tb !important;
+    text-orientation: mixed !important;
+}
+
+@media (max-width: 900px) {
+    #rmf_settings .rmf-checkline,
+    #rmf_extension_drawer .rmf-checkline {
+        grid-column: 1 / -1 !important;
+    }
+}
