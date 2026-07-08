@@ -14,8 +14,8 @@
     right: 22px;
     bottom: 120px;
     z-index: 2999;
-    width: 58px;
-    height: 58px;
+    width: 44px;
+    height: 44px;
     border: 1px solid rgba(120, 220, 255, .46);
     border-radius: 22px;
     display: grid;
@@ -388,8 +388,8 @@
 
 .rmf-graph-wrap {
     position: relative;
-    height: 310px;
-    border-radius: 20px;
+    height: 238px;
+    border-radius: 18px;
     overflow: hidden;
     background:
         radial-gradient(circle at 50% 44%, rgba(58, 210, 255, .20), transparent 25%),
@@ -424,10 +424,10 @@
 
 .rmf-edge text {
     fill: rgba(224, 245, 255, .92);
-    font-size: 3.2px;
+    font-size: 2.45px;
     paint-order: stroke;
     stroke: rgba(18, 25, 45, .9);
-    stroke-width: .9px;
+    stroke-width: .65px;
     stroke-linejoin: round;
 }
 
@@ -437,20 +437,20 @@
     z-index: 2;
     display: grid;
     justify-items: center;
-    gap: 5px;
-    max-width: 86px;
+    gap: 3px;
+    max-width: 72px;
 }
 
 .rmf-avatar {
-    width: 58px;
-    height: 58px;
+    width: 44px;
+    height: 44px;
     border-radius: 50%;
     display: grid;
     place-items: center;
     overflow: hidden;
     background: radial-gradient(circle at 35% 25%, rgba(255,255,255,.36), transparent 22%), linear-gradient(135deg, rgba(62, 211, 255, .96), rgba(66, 92, 210, .95));
     border: 2px solid rgba(121, 222, 255, .82);
-    box-shadow: 0 0 0 5px rgba(41, 180, 255, .16), 0 8px 22px rgba(0,0,0,.34);
+    box-shadow: 0 0 0 4px rgba(41, 180, 255, .14), 0 6px 16px rgba(0,0,0,.30);
 }
 
 .rmf-avatar img {
@@ -466,18 +466,18 @@
 }
 
 .rmf-node.is-center .rmf-avatar {
-    width: 92px;
-    height: 92px;
+    width: 68px;
+    height: 68px;
     border-width: 3px;
-    box-shadow: 0 0 0 9px rgba(45, 205, 255, .18), 0 0 38px rgba(72, 216, 255, .36), 0 14px 34px rgba(0,0,0,.38);
+    box-shadow: 0 0 0 6px rgba(45, 205, 255, .16), 0 0 24px rgba(72, 216, 255, .30), 0 10px 24px rgba(0,0,0,.34);
 }
 
 .rmf-node-name {
-    max-width: 110px;
-    padding: 3px 7px;
+    max-width: 92px;
+    padding: 2px 6px;
     border-radius: 999px;
     color: white;
-    font-size: 12px;
+    font-size: 11px;
     font-weight: 800;
     text-align: center;
     background: rgba(28, 63, 110, .62);
@@ -489,7 +489,7 @@
 }
 
 .rmf-node.is-center .rmf-node-name {
-    font-size: 15px;
+    font-size: 12px;
     background: rgba(26, 111, 169, .72);
 }
 
@@ -589,7 +589,7 @@
     }
 
     .rmf-graph-wrap {
-        height: 260px;
+        height: 218px;
     }
 }
 
@@ -636,7 +636,7 @@
 
 .rmf-index-scroll {
     overflow: auto;
-    max-height: 260px;
+    max-height: 218px;
 }
 
 .rmf-index-table-card table {
@@ -928,5 +928,47 @@
     #rmf_extension_drawer .menu_button {
         min-height: 46px !important;
         font-size: 12px !important;
+    }
+}
+
+
+/* v0.4.4 — API 保存 / 拉取模型按钮 */
+.rmf-api-actions {
+    display: flex;
+    gap: 10px;
+    align-items: end;
+    justify-content: flex-start;
+    flex-wrap: wrap;
+    padding-top: 18px;
+}
+
+.rmf-api-actions .menu_button {
+    min-height: 38px;
+    flex: 1 1 130px;
+}
+
+/* v0.4.4 — 关系图缩小，避免挡住文字 */
+.rmf-graph-lines {
+    pointer-events: none;
+}
+
+.rmf-edge text {
+    dominant-baseline: central;
+}
+
+@media (max-width: 560px) {
+    .rmf-api-actions {
+        padding-top: 0;
+    }
+    .rmf-graph-wrap {
+        height: 205px;
+    }
+    .rmf-node.is-center .rmf-avatar {
+        width: 60px;
+        height: 60px;
+    }
+    .rmf-avatar {
+        width: 38px;
+        height: 38px;
     }
 }

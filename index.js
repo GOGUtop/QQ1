@@ -1,4 +1,4 @@
-// Role Memory Forge v0.4.3
+// Role Memory Forge v0.4.4
 // 这一版不再使用会直接炸掉插件的静态 import。
 // SillyTavern 内部模块路径有时会随版本变化，静态 import 一旦失败，悬浮球和入口都会消失。
 // 这里改为：先渲染 UI，再动态按需加载 ST API / WorldInfo API。
@@ -174,6 +174,7 @@ const DEFAULT_SETTINGS = Object.freeze({
     baseUrl: 'https://api.openai.com/v1',
     apiKey: '',
     model: '',
+    modelOptions: [],
     chunkSize: 20,
     megaEvery: 5,
     injectDepth: 4,
@@ -1195,9 +1196,107 @@ function normalizeChatCompletionsUrl(baseUrl) {
     return `${url}/v1/chat/completions`;
 }
 
+
+function normalizeModelsUrl(baseUrl) {
+    const url = String(baseUrl || '').trim().replace(/\/+$/, '');
+    if (!url) throw new Error('API 地址为空');
+    if (/\/models$/i.test(url)) return url;
+    if (/\/chat\/completions$/i.test(url)) return url.replace(/\/chat\/completions$/i, '/models');
+    if (/\/v1$/i.test(url)) return `${url}/models`;
+    return `${url}/v1/models`;
+}
+
+function buildOpenAIHeaders(s) {
+    const headers = { 'Content-Type': 'application/json' };
+    const key = String(s?.apiKey || '').trim();
+    if (key) headers.Authorization = `Bearer ${key}`;
+    return headers;
+}
+
+async function fetchOpenAICompatibleModels() {
+    const s = settings();
+    const url = normalizeModelsUrl(s.baseUrl);
+    const response = await fetch(url, {
+        method: 'GET',
+        headers: buildOpenAIHeaders(s),
+        cache: 'no-cache',
+    });
+    if (!response.ok) {
+        const detail = await response.text().catch(() => '');
+        throw new Error(`模型列表拉取失败：${response.status} ${detail.slice(0, 220)}`);
+    }
+    const data = await response.json();
+    const raw = Array.isArray(data?.data) ? data.data
+        : Array.isArray(data?.models) ? data.models
+        : Array.isArray(data) ? data
+        : [];
+    const ids = raw.map((item) => {
+        if (typeof item === 'string') return item;
+        return item?.id || item?.name || item?.model || item?.root;
+    }).filter(Boolean).map(String);
+    return [...new Set(ids)].sort((a, b) => a.localeCompare(b));
+}
+
+function readApiSettingsFromPanel() {
+    const s = settings();
+    const val = (id) => document.querySelector(`#${id}`)?.value ?? '';
+    s.source = val('rmf_source') || s.source || 'st';
+    s.baseUrl = String(val('rmf_baseUrl') || '').trim();
+    s.apiKey = String(val('rmf_apiKey') || '').trim();
+    s.model = String(val('rmf_model') || '').trim();
+    saveSettings();
+    return s;
+}
+
+function populateModelSelectOptions() {
+    const select = document.querySelector('#rmf_modelSelect');
+    if (!select) return;
+    const s = settings();
+    const options = Array.isArray(s.modelOptions) ? s.modelOptions : [];
+    const current = String(s.model || '').trim();
+    select.innerHTML = '';
+    select.append(new Option(options.length ? '请选择拉取到的模型' : '先点“拉取模型”', ''));
+    if (current && !options.includes(current)) select.append(new Option(`当前：${current}`, current));
+    for (const id of options) select.append(new Option(id, id));
+    select.value = current && [...select.options].some((opt) => opt.value === current) ? current : '';
+}
+
+async function saveApiSettingsFromPanel({ silent = false } = {}) {
+    const s = readApiSettingsFromPanel();
+    populateModelSelectOptions();
+    if (!silent) {
+        toast(`API 配置已保存${s.model ? `：${s.model}` : ''}`, 'success');
+        updateStatus('API 配置已保存');
+    }
+}
+
+async function fetchModelsFromPanel() {
+    try {
+        updateStatus('正在拉取模型列表…');
+        await saveApiSettingsFromPanel({ silent: true });
+        const s = settings();
+        if (s.source !== 'openai') {
+            s.source = 'openai';
+            const source = document.querySelector('#rmf_source');
+            if (source) source.value = 'openai';
+        }
+        const models = await fetchOpenAICompatibleModels();
+        if (!models.length) throw new Error('接口返回了空模型列表');
+        s.modelOptions = models;
+        if (!s.model || !models.includes(s.model)) s.model = models[0];
+        saveSettings();
+        refreshPanelValues();
+        toast(`已拉取 ${models.length} 个模型`, 'success');
+        updateStatus(`已拉取 ${models.length} 个模型`);
+    } catch (error) {
+        warn('fetch models failed', error);
+        toast(error.message || '模型列表拉取失败', 'error');
+        updateStatus(`模型拉取失败：${error.message || error}`);
+    }
+}
+
 async function callOpenAICompatible(prompt, { json = true } = {}) {
     const s = settings();
-    if (!s.apiKey?.trim()) throw new Error('API Key 为空');
     if (!s.model?.trim()) throw new Error('模型名为空');
     const url = normalizeChatCompletionsUrl(s.baseUrl);
     const body = {
@@ -1213,10 +1312,7 @@ async function callOpenAICompatible(prompt, { json = true } = {}) {
 
     let response = await fetch(url, {
         method: 'POST',
-        headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${s.apiKey.trim()}`,
-        },
+        headers: buildOpenAIHeaders(s),
         body: JSON.stringify(body),
     });
 
@@ -1224,10 +1320,7 @@ async function callOpenAICompatible(prompt, { json = true } = {}) {
         delete body.response_format;
         response = await fetch(url, {
             method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                Authorization: `Bearer ${s.apiKey.trim()}`,
-            },
+            headers: buildOpenAIHeaders(s),
             body: JSON.stringify(body),
         });
     }
@@ -2277,11 +2370,20 @@ function renderSettingsPanel() {
                                 <input id="rmf_baseUrl" type="text" placeholder="https://api.openai.com/v1 或 http://127.0.0.1:8000/v1">
                             </label>
                             <label>API Key
-                                <input id="rmf_apiKey" type="password" autocomplete="off" placeholder="sk-...">
+                                <input id="rmf_apiKey" type="password" autocomplete="off" placeholder="sk-...；本地接口可留空">
                             </label>
-                            <label>模型名
+                            <label>模型选择
+                                <select id="rmf_modelSelect">
+                                    <option value="">先点“拉取模型”</option>
+                                </select>
+                            </label>
+                            <label>模型名 / 手动填写
                                 <input id="rmf_model" type="text" placeholder="gpt-4o-mini / deepseek-chat / Qwen...">
                             </label>
+                            <div class="rmf-api-actions">
+                                <button id="rmf_saveApi" class="menu_button" type="button">保存 API 配置</button>
+                                <button id="rmf_fetchModels" class="menu_button rmf-primary-action" type="button">拉取模型</button>
+                            </div>
                             <label>最大输出 Token
                                 <input id="rmf_maxOutputTokens" type="number" min="128" max="8000">
                             </label>
@@ -2370,7 +2472,7 @@ function renderSettingsPanel() {
                         <button id="rmf_clear" class="menu_button danger">清空当前记忆</button>
                     </div>
 
-                    <div class="rmf-note">提示：默认直接写入“角色卡自带世界书”，不会额外新开 RMF 世界书；导入别人的旧聊天记录后，点“一键记忆历史聊天记录”即可从 0 层补录到当前；点“走马灯回顾”会让模型整理一条从开头到当前的详细剧情回放，并可作为 AI 回复写入聊天，用来测试记忆是否有效。</div>
+                    <div class="rmf-note">提示：默认直接写入“角色卡自带世界书”，不会额外新开 RMF 世界书；API 可以先保存再拉取模型；导入别人的旧聊天记录后，点“一键记忆历史聊天记录”即可从 0 层补录到当前；向量化记忆暂不默认启用，当前版本优先使用分层总结 + 世界书注入，稳定后再做 embedding 召回。</div>
                 </main>
             </div>
         </section>
@@ -2463,6 +2565,20 @@ function bindPanelEvents() {
         });
     }
 
+    document.querySelector('#rmf_saveApi')?.addEventListener('click', () => saveApiSettingsFromPanel());
+    document.querySelector('#rmf_fetchModels')?.addEventListener('click', () => fetchModelsFromPanel());
+    document.querySelector('#rmf_modelSelect')?.addEventListener('change', (event) => {
+        const value = String(event.target.value || '').trim();
+        if (!value) return;
+        const input = document.querySelector('#rmf_model');
+        if (input) input.value = value;
+        settings().model = value;
+        saveSettings();
+        toast(`已选择模型：${value}`, 'success');
+        updateStatus(`已选择模型：${value}`);
+    });
+
+
     document.querySelector('#rmf_process')?.addEventListener('click', () => processLatestExchange({ force: true }));
     document.querySelector('#rmf_history')?.addEventListener('click', () => oneClickRememberHistory());
     document.querySelector('#rmf_walkthrough')?.addEventListener('click', () => generateWalkthrough().catch((error) => { warn('walkthrough failed', error); toast(`走马灯失败：${error.message}`, 'error'); updateStatus(`走马灯失败：${error.message}`); }));
@@ -2501,6 +2617,7 @@ function refreshPanelValues() {
     set('rmf_baseUrl', s.baseUrl);
     set('rmf_apiKey', s.apiKey);
     set('rmf_model', s.model);
+    populateModelSelectOptions();
     set('rmf_maxOutputTokens', s.maxOutputTokens);
     set('rmf_temperature', s.temperature);
     set('rmf_chunkSize', s.chunkSize);
